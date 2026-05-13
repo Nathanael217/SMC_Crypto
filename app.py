@@ -85,6 +85,7 @@ try:
         mode_custom_filter,
         render_screener_table,
     )
+    from qf_smc.render import render_signal_card_detail_v2
     SMC_AVAILABLE = True
     SMC_IMPORT_ERROR = None
 except ImportError as e:
@@ -11781,6 +11782,20 @@ def render_smc_mode_scan_subtab():
         f"Lookback: {mode_cfg['lookback']} bars"
     )
 
+    # ATR multiplier slider — controls Fibo 0.786 zone tolerance (NEW v1.2/R3)
+    with st.expander("⚙️ Advanced Settings", expanded=False):
+        atr_multiplier = st.slider(
+            "Fibo 0.786 zone tolerance (×ATR)",
+            min_value=0.3, max_value=2.0, value=0.5, step=0.1,
+            help=(
+                "Width of the Fibo 0.786 zone in multiples of the coin's ATR. "
+                "Lower = stricter zone, fewer but higher-quality setups. "
+                "Higher = wider zone, more setups including borderline cases. "
+                "Default 0.5 = narrow band."
+            ),
+        )
+        st.session_state["smc_atr_multiplier"] = atr_multiplier
+
     if st.button("🚀 Run SMC Scan", type="primary"):
         btc_regime = st.session_state.get("smc_btc_regime", "UNKNOWN")
 
@@ -11796,6 +11811,7 @@ def render_smc_mode_scan_subtab():
                 mode=mode,
                 symbols=candidates,
                 btc_regime=btc_regime,
+                atr_multiplier=st.session_state.get("smc_atr_multiplier", 0.5),
                 progress_callback=progress_callback,
             )
 
@@ -11851,12 +11867,12 @@ def render_smc_results_subtab():
         any_shown = True
         st.markdown(f"## {icons[zone_type]} {labels[zone_type]} ({len(items)})")
         for r in items:
-            render_smc_signal_card(r)
+            render_signal_card_detail_v2(r)
 
     if ungrouped:
         st.markdown(f"## ⬜ Other Setups ({len(ungrouped)})")
         for r in ungrouped:
-            render_smc_signal_card(r)
+            render_signal_card_detail_v2(r)
         any_shown = True
 
     if not any_shown:
