@@ -1,14 +1,26 @@
 """
 qf_smc/scanner.py — Multi-TF SMC scanner orchestrator
 ======================================================
-Coordinates structure detection, zone detection, LTF confirmation, backtest,
-and trade plan building per QUANTFLOW SMC Long spec v1.1 §5.5.
+Coordinates structure detection, zone detection, LTF confirmation, variant-grid
+backtest, and trade plan building per QUANTFLOW SMC Long spec v1.2 §2.6.
+
+Revision v1.2 changes (spec §2.6):
+  - scan_one_symbol / run_scan accept atr_multiplier (float, default 0.5)
+  - Fibo zone is computed FIRST; coin skipped if no current leg
+  - All zone detectors receive fibo_786_zone + require_in_zone=True
+  - Coin skipped if no zones land in Fibo 0.786 area
+  - pick_primary_zone: LIQUIDITY_SWEEP added as priority 1
+  - Old backtest_per_coin call replaced by run_variant_grid (24 variants)
+  - Result dict enriched with fibo_zone, atr_multiplier_used, wick_adjustments,
+    overall_bullish_verified, ob_tier, variant_grid, best_variant,
+    deep_dive_available
 
 Public API:
   - MODE_CONFIG: dict
-  - run_scan(mode, symbols, btc_regime, progress_callback)
-  - scan_one_symbol(symbol, mode, btc_regime)
-  - helpers: check_ltf_confirmation, build_trade_plan, classify_ema_tier, pick_primary_zone
+  - run_scan(mode, symbols, btc_regime, atr_multiplier, progress_callback)
+  - scan_one_symbol(symbol, mode, btc_regime, atr_multiplier)
+  - helpers: check_ltf_confirmation, build_trade_plan, classify_ema_tier,
+             pick_primary_zone
 """
 
 import streamlit as st
@@ -30,6 +42,7 @@ from qf_smc.zones import (
 from qf_smc.backtest import (
     backtest_per_coin, backtest_universe_baseline,
     bayesian_blend, compute_recent_check,
+    run_variant_grid,                # NEW v1.2
 )
 
 
@@ -43,15 +56,7 @@ MODE_CONFIG: Dict[str, Dict[str, Any]] = {
     "SCALP": {"htf": "1h",  "ltf": "5m",  "lookback": 50, "htf_label": "1H", "ltf_label": "5m"},
 }
 
-# Map entry zone types to backtest method combos (sl_method, tp_method)
-_ZONE_BACKTEST_PARAMS: Dict[str, Dict[str, str]] = {
-    "smart_ob":  {"sl_method": "structural", "tp_method": "fixed_R"},
-    "fvg":       {"sl_method": "structural", "tp_method": "fixed_R"},
-    "fibo_786":  {"sl_method": "fixed",      "tp_method": "fixed_R"},
-    "sr":        {"sl_method": "structural", "tp_method": "fixed_R"},
-}
-
-# Default TP R-multiple for backtest
+# Default TP R-multiple for legacy backtest_per_coin calls (still available)
 _DEFAULT_TP_R = 2.0
 
 
@@ -63,6 +68,7 @@ def run_scan(
     mode: str,
     symbols: List[str],
     btc_regime: str,
+    atr_multiplier: float = 0.5,                              # NEW v1.2
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -74,6 +80,8 @@ def run_scan(
         btc_regime: "BULL" | "CHOP" | "BEAR" | "UNKNOWN"
                     (used for BADGE + AI context only — NOT a skip gate.
                     Scanner runs symbols regardless of BTC regime.)
+        atr_multiplier: ATR×N tolerance for Fibo 0.786 zone (default 0.5).
+                        Streamlit UI exposes a slider 0.3–2.0 for this value.
         progress_callback: optional callback(current_idx, total, symbol_name)
                           fired once per symbol for UI progress display
 
@@ -88,11 +96,13 @@ def run_scan(
         if progress_callback:
             progress_callback(idx + 1, len(symbols), symbol)
         try:
-            result = scan_one_symbol(symbol, mode, btc_regime)
+            result = scan_one_symbol(
+                symbol, mode, btc_regime,
+                atr_multiplier=atr_multiplier,
+            )
             if result is not None:
                 results.append(result)
         except Exception as e:
-            # Log error to console but continue scanning
             print(f"[scanner] error scanning {symbol}: {e}")
             continue
 
@@ -107,6 +117,7 @@ def scan_one_symbol(
     symbol: str,
     mode: str,
     btc_regime: str,
+    atr_multiplier: float = 0.5,    # NEW v1.2
 ) -> Optional[Dict[str, Any]]:
     """
     Full pipeline for ONE symbol.
@@ -117,16 +128,24 @@ def scan_one_symbol(
         3.  If either fetch fails or returns < 30 bars → return None
         4.  Run structure.detect_swings + classify_structure on HTF
         5.  If state not in {"BOS", "UPTREND"} → return None
-        6.  Run zones detectors on HTF
-        7.  Check EMA 50 & EMA 200 confidence tier
-        8.  classify_current_price_in_zones(current_price, ...)
-        9.  If classification['any'] is False → return None
-       10.  Run LTF confirmation check
-       11.  Pick PRIMARY zone
-       12.  Run backtest for the primary zone's setup
-       13.  Compute fights_macro = btc_regime in {"BEAR"}
-       14.  Build trade_plan
-       15.  Return result dict
+        6.  NEW v1.2: compute Fibo zone FIRST (requires structure.current_leg)
+              → return None if current_leg is absent
+        7.  Run zone detectors WITH Fibo 0.786 filter
+        8.  If no zones found in Fibo 0.786 area → check Fibo 0.786 itself;
+              if even that is absent from the fibo_zone dict → return None
+        9.  Check EMA 50 & EMA 200 confidence tier
+       10.  classify_current_price_in_zones(current_price, ...)
+       11.  If classification['any'] is False → return None
+       12.  Pick PRIMARY zone
+       13.  Run LTF confirmation check
+       14.  Run 24-variant grid backtest (run_variant_grid)
+       15.  Compute fights_macro = btc_regime in {"BEAR"}
+       16.  Build trade_plan from primary_zone
+       17.  Return enriched result dict
+
+    Args:
+        atr_multiplier: ATR×N tolerance for Fibo 0.786 zone (default 0.5).
+                        Streamlit UI exposes a slider 0.3–2.0 for this.
 
     Returns:
         Full result dict, or None if filtered out.
@@ -141,7 +160,7 @@ def scan_one_symbol(
     lookback     = cfg["lookback"]
 
     # ── Step 1-2: Fetch candles ──────────────────────────────────────────────
-    # Use deeper fetch for HTF to give backtest meaningful history (≥200 bars)
+    # Deep fetch for HTF — gives variant grid meaningful history (≥200 bars)
     df_htf = _scanner_fetch_candles(symbol, htf_interval, limit=500)
     df_ltf = _scanner_fetch_candles(symbol, ltf_interval, limit=lookback + 50)
 
@@ -163,115 +182,139 @@ def scan_one_symbol(
     if not is_uptrend_confirmed(structure):
         return None  # state is UNDEFINED, DOWNTREND, or CHOCH
 
-    # ── Step 6: Zone detection on HTF ────────────────────────────────────────
-    smart_obs = detect_smart_obs(df_htf, structure)
-    fvgs      = detect_fvgs(df_htf, structure)
-    fibo      = detect_fibo_levels(df_htf, structure)
-    sr_levels = detect_sr_levels(df_htf, lookback=lookback)
+    # ── Step 6: Fibo zone FIRST (v1.2) ───────────────────────────────────────
+    # detect_fibo_levels returns {} when current_leg is absent
+    fibo_zone = detect_fibo_levels(df_htf, structure, atr_multiplier=atr_multiplier)
+    if not fibo_zone:
+        return None  # no current leg → can't define zone
 
-    # Early exit if no zones at all (saves EMA computation)
-    zones_exist = bool(smart_obs or fvgs or fibo or sr_levels)
-    if not zones_exist:
-        return None
+    # ── Step 7: Zone detectors WITH Fibo 0.786 filter ────────────────────────
+    smart_obs = detect_smart_obs(df_htf, structure, fibo_786_zone=fibo_zone, require_in_zone=True)
+    fvgs      = detect_fvgs(df_htf, structure, fibo_786_zone=fibo_zone, require_in_zone=True)
+    sr_levels = detect_sr_levels(df_htf, lookback=lookback, fibo_786_zone=fibo_zone, require_in_zone=True)
 
-    # ── Step 7: EMA tier ─────────────────────────────────────────────────────
+    # ── Step 8: Require at least one zone inside Fibo 0.786 area ─────────────
+    if not smart_obs and not fvgs and not sr_levels:
+        # Last-resort: accept if fib_786_zone_top is defined (price may enter
+        # the zone itself as the trade trigger — fibo_786 entry variant)
+        if "fib_786_zone_top" not in fibo_zone:
+            return None
+        # Fall through — run_variant_grid will populate only fibo_786 variants
+
+    # ── Step 9: EMA tier ─────────────────────────────────────────────────────
     current_price = float(df_htf["close"].iloc[-1])
     ema_tier = classify_ema_tier(df_htf, current_price)
     if ema_tier == "SKIP":
         return None
 
-    # ── Step 8: Zone classification ──────────────────────────────────────────
+    # ── Step 10: Zone classification ─────────────────────────────────────────
     zone_cls = classify_current_price_in_zones(
-        current_price, smart_obs, fvgs, fibo, sr_levels
+        current_price, smart_obs, fvgs, fibo_zone, sr_levels
     )
 
-    # ── Step 9: Require at least one actionable zone ─────────────────────────
+    # ── Step 11: Require at least one actionable zone ────────────────────────
     if not zone_cls.get("any", False):
         return None
 
-    # ── Step 10: Pick primary zone ───────────────────────────────────────────
-    primary_zone = pick_primary_zone(zone_cls, fibo=fibo)
+    # ── Step 12: Pick primary zone ───────────────────────────────────────────
+    primary_zone = pick_primary_zone(zone_cls, fibo=fibo_zone)
     if primary_zone is None:
         return None
 
-    # ── Step 11: LTF confirmation ─────────────────────────────────────────────
-    ltf_result = check_ltf_confirmation(df_ltf, primary_zone)
+    # ── ob_tier: tier of primary zone if it is a smart_ob ────────────────────
+    ob_tier: Optional[str] = None
+    if primary_zone["type"] == "smart_ob":
+        ob_tier = primary_zone["data"].get("tier")  # "LIQUIDITY_SWEEP"|"STRONG"|"REGULAR"
+
+    # ── Step 13: LTF confirmation ─────────────────────────────────────────────
+    ltf_result       = check_ltf_confirmation(df_ltf, primary_zone)
     ltf_confirmation = ltf_result["status"]
     ltf_signal_bar   = ltf_result.get("signal_bar")
 
-    # ── Step 12: Backtest for primary zone setup ──────────────────────────────
-    zone_type   = primary_zone["type"]
-    bt_params   = _ZONE_BACKTEST_PARAMS.get(zone_type, {"sl_method": "structural", "tp_method": "fixed_R"})
-    sl_method   = bt_params["sl_method"]
-    tp_method   = bt_params["tp_method"]
-    tp_R        = _DEFAULT_TP_R
+    # ── Step 14: 24-variant backtest grid ─────────────────────────────────────
+    low_confidence = len(df_htf) < 100
 
-    per_coin_bt = backtest_per_coin(
+    variant_grid: pd.DataFrame = run_variant_grid(
         df_htf=df_htf,
-        df_ltf=None,
-        entry_zone_type=zone_type,
-        sl_method=sl_method,
-        tp_method=tp_method,
-        tp_R=tp_R,
-        max_setups_to_replay=200,
-        simplified=False,
+        df_ltf=df_ltf,
+        structure=structure,
+        fibo_zone=fibo_zone,
+        smart_obs=smart_obs,
+        fvgs=fvgs,
+        sr_levels=sr_levels,
     )
 
-    # Mark low_confidence if backtest returned zero setups
-    if per_coin_bt["n_setups"] == 0:
-        per_coin_bt["low_confidence"] = True
+    # Attach metadata flag for thin data
+    if low_confidence:
+        variant_grid["low_confidence"] = True
 
-    universe_bt = backtest_universe_baseline(
-        entry_zone_type=zone_type,
-        sl_method=sl_method,
-        tp_method=tp_method,
-        tp_R=tp_R,
-        timeframe=htf_interval,
-        n_sample_coins=50,
-    )
+    # Best variant = row with highest profit factor
+    best_variant: Optional[Dict[str, Any]] = None
+    if not variant_grid.empty:
+        best_variant = variant_grid.iloc[0].to_dict()
 
-    blended = bayesian_blend(per_coin_bt, universe_bt, prior_strength=30)
-
-    trades_raw = per_coin_bt.get("trades_raw", [])
-    recent_check = compute_recent_check(trades_raw, n_df=len(df_htf))
-
-    backtest_summary = {
-        "per_coin":     per_coin_bt,
-        "universe":     universe_bt,
-        "blended":      blended,
-        "recent_check": recent_check,
-    }
-
-    # ── Step 13: Macro flag ───────────────────────────────────────────────────
+    # ── Step 15: Macro flag ───────────────────────────────────────────────────
     fights_macro = btc_regime in {"BEAR"}
 
-    # ── Step 14: Trade plan ───────────────────────────────────────────────────
+    # ── Step 16: Trade plan ───────────────────────────────────────────────────
     trade_plan = build_trade_plan(primary_zone, current_price, df_htf, structure)
 
-    # ── Step 15: Build result dict ────────────────────────────────────────────
+    # ── Step 17: Transparency fields from structure ───────────────────────────
+    wick_adjustments        = swings.get("wick_adjustments", [])
+    overall_bullish_verified = structure.get("overall_bullish_verified", False)
+
+    # ── Step 18: Build result dict ────────────────────────────────────────────
     return {
+        # ── identity ──────────────────────────────────────────────────────────
         "symbol":       symbol,
         "mode":         mode,
         "htf_tf":       htf_interval,
         "ltf_tf":       ltf_interval,
         "btc_regime":   btc_regime,
         "fights_macro": fights_macro,
-        "ema_tier":     ema_tier,
-        "structure":    structure,
+
+        # ── structure ─────────────────────────────────────────────────────────
+        "structure":                 structure,
+        "overall_bullish_verified":  overall_bullish_verified,   # NEW v1.2
+        "wick_adjustments":          wick_adjustments,           # NEW v1.2
+
+        # ── fibo zone (NEW v1.2) ───────────────────────────────────────────────
+        "fibo_zone":           fibo_zone,
+        "atr_multiplier_used": atr_multiplier,
+
+        # ── other zones ───────────────────────────────────────────────────────
         "zones": {
             "smart_obs":  smart_obs,
             "fvgs":       fvgs,
-            "fibo":       fibo,
+            "fibo":       fibo_zone,        # kept under legacy key for UI compat
             "sr_levels":  sr_levels,
         },
+
+        # ── price + zone classification ───────────────────────────────────────
         "current_price":              current_price,
         "current_zone_classification": zone_cls,
         "primary_zone":               primary_zone,
-        "ltf_confirmation":           ltf_confirmation,
-        "ltf_signal_bar":             ltf_signal_bar,
-        "backtest":                   backtest_summary,
-        "trade_plan":                 trade_plan,
-        "timestamp_utc":              datetime.now(timezone.utc).isoformat(),
+        "ob_tier":                    ob_tier,           # NEW v1.2
+        "ema_tier":                   ema_tier,
+
+        # ── LTF confirmation ──────────────────────────────────────────────────
+        "ltf_confirmation": ltf_confirmation,
+        "ltf_signal_bar":   ltf_signal_bar,
+
+        # ── backtest (v1.2: variant grid replaces single backtest) ─────────────
+        "variant_grid":        variant_grid,      # pd.DataFrame 24 rows
+        "best_variant":        best_variant,       # dict: row with highest PF
+        "deep_dive_available": True,               # UI deep-dive button flag
+
+        # ── trade plan ────────────────────────────────────────────────────────
+        "trade_plan": trade_plan,
+
+        # ── df cache for deep-dive (NEW v1.2 — required by render.py) ─────────
+        "_df_htf_cache": df_htf,
+        "_df_ltf_cache": df_ltf,
+
+        # ── metadata ──────────────────────────────────────────────────────────
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -359,10 +402,6 @@ def check_ltf_confirmation(
                 }
 
     # ── Test 2: Strong bullish reversal candle in last 5 LTF bars ────────────
-    # Conditions:
-    #   - close in upper third of candle range  (bullish close)
-    #   - volume >= 1.5× 20-bar average
-    #   - bar overlaps the HTF zone
     vol_avg_period = min(20, n - 6)
     check_start    = max(0, n - 5)
 
@@ -601,14 +640,15 @@ def pick_primary_zone(
     From the dict output of classify_current_price_in_zones, pick the PRIMARY
     zone for trade-planning purposes.
 
-    Priority order (highest to lowest):
-        1. STRONG smart_ob   (highest conviction)
-        2. fvg FRESH
-        3. REGULAR smart_ob
-        4. fvg PARTIAL_<50
-        5. fibo_786
-        6. sr_support
-        7. fvg PARTIAL_>50
+    Priority order v1.2 (highest to lowest):
+        1. LIQUIDITY_SWEEP smart_ob  (NEW v1.2 — strongest reversal signal)
+        2. STRONG smart_ob
+        3. FVG FRESH
+        4. REGULAR smart_ob
+        5. FVG PARTIAL_<50
+        6. Fibo 0.786 (price within zone)
+        7. S/R support
+        8. FVG PARTIAL_>50
 
     Args:
         zone_classification: output of classify_current_price_in_zones()
@@ -624,43 +664,46 @@ def pick_primary_zone(
     in_fibo = zone_classification.get("in_fibo_786", False)
     in_srs  = zone_classification.get("at_sr_support", [])
 
-    # Priority 1: STRONG smart_ob
+    # Priority 1 (NEW v1.2): LIQUIDITY_SWEEP smart_ob — strongest reversal signal
+    liq_sweep_obs = [ob for ob in in_obs if ob.get("tier") == "LIQUIDITY_SWEEP"]
+    if liq_sweep_obs:
+        best = max(liq_sweep_obs, key=lambda x: x.get("freshness_score", 0.0))
+        return {"type": "smart_ob", "data": best}
+
+    # Priority 2: STRONG smart_ob
     strong_obs = [ob for ob in in_obs if ob.get("tier") == "STRONG"]
     if strong_obs:
-        # Pick the freshest (highest freshness_score) among STRONG OBs
         best = max(strong_obs, key=lambda x: x.get("freshness_score", 0.0))
         return {"type": "smart_ob", "data": best}
 
-    # Priority 2: FRESH fvg
+    # Priority 3: FRESH fvg
     fresh_fvgs = [f for f in in_fvgs if f.get("status") == "FRESH"]
     if fresh_fvgs:
-        # Pick the most recently created FRESH FVG
         best = max(fresh_fvgs, key=lambda x: x.get("created_at_bar", 0))
         return {"type": "fvg", "data": best}
 
-    # Priority 3: REGULAR smart_ob
+    # Priority 4: REGULAR smart_ob
     regular_obs = [ob for ob in in_obs if ob.get("tier") == "REGULAR"]
     if regular_obs:
         best = max(regular_obs, key=lambda x: x.get("freshness_score", 0.0))
         return {"type": "smart_ob", "data": best}
 
-    # Priority 4: fvg PARTIAL_<50
+    # Priority 5: fvg PARTIAL_<50
     partial_lt50 = [f for f in in_fvgs if f.get("status") == "PARTIAL_<50"]
     if partial_lt50:
         best = max(partial_lt50, key=lambda x: x.get("created_at_bar", 0))
         return {"type": "fvg", "data": best}
 
-    # Priority 5: fibo_786
+    # Priority 6: fibo_786
     if in_fibo and fibo:
         return {"type": "fibo_786", "data": fibo}
 
-    # Priority 6: sr_support
+    # Priority 7: sr_support
     if in_srs:
-        # Pick the strongest S/R level
         best = max(in_srs, key=lambda x: x.get("strength", 0.0))
         return {"type": "sr", "data": best}
 
-    # Priority 7: fvg PARTIAL_>50 (least preferred)
+    # Priority 8: fvg PARTIAL_>50 (least preferred)
     partial_gt50 = [f for f in in_fvgs if f.get("status") == "PARTIAL_>50"]
     if partial_gt50:
         best = max(partial_gt50, key=lambda x: x.get("created_at_bar", 0))
