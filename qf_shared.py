@@ -1008,11 +1008,21 @@ def _scanner_get_universe_all() -> list:
     return _scanner_get_universe(min_volume_usdt=0.0)
 
 
-def _scanner_fetch_candles(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
+def _scanner_fetch_candles(
+    symbol: str,
+    interval: str,
+    limit: int = 200,
+    timeout: float = 10.0,
+) -> pd.DataFrame:
     """
     Fetch last `limit` klines for symbol/interval from Binance.
     Returns cleaned DataFrame or empty DataFrame on failure.
     No caching — called inside thread workers.
+
+    Args:
+        timeout: per-request HTTP timeout in seconds. The SMC scanner passes
+                 a short value (e.g. 5s) so a slow/hung coin fails fast and
+                 gets skipped instead of stalling the whole scan.
     """
     urls = [
         ("https://api.binance.com/api/v3/klines",         True),
@@ -1025,7 +1035,7 @@ def _scanner_fetch_candles(symbol: str, interval: str, limit: int = 200) -> pd.D
             resp = requests.get(
                 url,
                 params={"symbol": symbol, "interval": interval, "limit": limit},
-                timeout=10,
+                timeout=timeout,
                 verify=verify,
             )
             if resp.status_code != 200:
