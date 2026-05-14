@@ -409,24 +409,53 @@ def render_deep_dive_results(result: Dict[str, Any]) -> None:
     plan = deep.get("recommended_trade_plan") or {}
     if plan:
         st.markdown("### \U0001f4cb Recommended Trade Plan")
-        plan_cols = st.columns(2)
-        with plan_cols[0]:
-            st.text(f"Entry type:  {plan.get('entry_type', '?')}")
-            st.text(f"LTF mode:    {plan.get('ltf_mode', '?')}")
-            st.text(f"Management:  {plan.get('management', '?')}")
-            st.text(f"TP target:   {plan.get('tp_R', '?')}R")
-        with plan_cols[1]:
-            entry_p = float(plan.get("entry_price", 0))
-            sl_p    = float(plan.get("sl",           0))
-            risk_p  = float(plan.get("risk_pct",     0))
-            tp1_p   = float(plan.get("tp1_price",    0))
-            tp2_p   = float(plan.get("tp2_price",    0))
-            tp3_p   = float(plan.get("tp3_price",    0))
-            st.text(f"Entry price: ${entry_p:.6f}")
-            st.text(f"Stop loss:   ${sl_p:.6f}  ({risk_p:.2f}% risk)")
-            st.text(f"TP1 (2R):    ${tp1_p:.6f}")
-            st.text(f"TP2 (2.5R):  ${tp2_p:.6f}")
-            st.text(f"TP3 (3R):    ${tp3_p:.6f}")
+
+        # Helper: safely coerce a possibly-None / possibly-str value to float
+        def _safe_float(val: Any, default: float = 0.0) -> float:
+            if val is None:
+                return default
+            try:
+                f = float(val)
+                # guard NaN
+                if f != f:  # NaN check
+                    return default
+                return f
+            except (TypeError, ValueError):
+                return default
+
+        # If the plan has no concrete entry (no current zone for the entry_type),
+        # show a graceful message instead of crashing on float(None).
+        if plan.get("entry_price") is None or plan.get("error"):
+            st.warning(
+                f"\u26a0\ufe0f No concrete trade plan available "
+                f"(entry type **{plan.get('entry_type', '?')}** has no live zone right now). "
+                f"{plan.get('error', '')}"
+            )
+            st.caption(
+                "The backtest variant scored well historically, but the matching "
+                "OB/FVG/SR zone is not currently present on the chart. Wait for the "
+                "zone to form, or check the 'Best Per Entry Type' table below for "
+                "an alternative entry that does have a live zone."
+            )
+        else:
+            plan_cols = st.columns(2)
+            with plan_cols[0]:
+                st.text(f"Entry type:  {plan.get('entry_type', '?')}")
+                st.text(f"LTF mode:    {plan.get('ltf_mode', '?')}")
+                st.text(f"Management:  {plan.get('management', '?')}")
+                st.text(f"TP target:   {plan.get('tp_R', '?')}R")
+            with plan_cols[1]:
+                entry_p = _safe_float(plan.get("entry_price"))
+                sl_p    = _safe_float(plan.get("sl"))
+                risk_p  = _safe_float(plan.get("risk_pct"))
+                tp1_p   = _safe_float(plan.get("tp1_price"))
+                tp2_p   = _safe_float(plan.get("tp2_price"))
+                tp3_p   = _safe_float(plan.get("tp3_price"))
+                st.text(f"Entry price: ${entry_p:.6f}")
+                st.text(f"Stop loss:   ${sl_p:.6f}  ({risk_p:.2f}% risk)")
+                st.text(f"TP1 (2R):    ${tp1_p:.6f}")
+                st.text(f"TP2 (2.5R):  ${tp2_p:.6f}")
+                st.text(f"TP3 (3R):    ${tp3_p:.6f}")
 
     # ─── Best Per Entry Type ──────────────────────────────────────────────────
     bpe = deep.get("best_per_entry", [])

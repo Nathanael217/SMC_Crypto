@@ -721,31 +721,100 @@ def deep_dive_backtest(
     best_overall: Optional[Dict] = df_72.iloc[0].to_dict() if not df_72.empty else None
 
     # ── Step 5: Recommended trade plan ───────────────────────────────────────
+    # The best_overall variant (highest PF) may be for an entry_type that has
+    # NO live zone right now (e.g. "sr" scored best historically but there is
+    # no current support level). In that case _build_trade_plan_from_variant
+    # returns entry_price=None. We try best_overall first, then fall back to
+    # other variants (sorted by PF) until we find one with a concrete zone.
     recommended_trade_plan: Optional[Dict] = None
-    if best_overall:
-        try:
-            recommended_trade_plan = _build_trade_plan_from_variant(
-                best_overall, fibo_zone, smart_obs, fvgs, sr_levels
-            )
-        except Exception as exc:
-            print(f"[backtest] trade plan build error for {symbol}: {exc}")
+    if not df_72.empty:
+        # Build an ordered list of candidate variant rows to try:
+        # best_overall first, then the rest of df_72 in PF order.
+        _candidate_rows: List[Dict] = []
+        if best_overall:
+            _candidate_rows.append(best_overall)
+        for _, _row in df_72.iterrows():
+            _rd = _row.to_dict()
+            # Avoid testing the exact same row twice
+            if best_overall and (
+                _rd.get("entry_type") == best_overall.get("entry_type")
+                and _rd.get("ltf_mode") == best_overall.get("ltf_mode")
+                and _rd.get("tp_R") == best_overall.get("tp_R")
+                and _rd.get("management") == best_overall.get("management")
+            ):
+                continue
+            _candidate_rows.append(_rd)
+
+        for _cand in _candidate_rows:
+            try:
+                _plan = _build_trade_plan_from_variant(
+                    _cand, fibo_zone, smart_obs, fvgs, sr_levels
+                )
+            except Exception as exc:
+                print(f"[backtest] trade plan build error for {symbol}: {exc}")
+                continue
+            # Accept the first plan that has a concrete entry_price
+            if _plan and _plan.get("entry_price") is not None:
+                recommended_trade_plan = _plan
+                break
+
+        # If NO variant had a live zone, still return the best_overall's
+        # (None-entry) plan so the UI can show a graceful "no live zone" message.
+        if recommended_trade_plan is None and best_overall:
+            try:
+                recommended_trade_plan = _build_trade_plan_from_variant(
+                    best_overall, fibo_zone, smart_obs, fvgs, sr_levels
+                )
+            except Exception as exc:
+                print(f"[backtest] trade plan fallback error for {symbol}: {exc}")
+                recommended_trade_plan = None
 
     # ── Step 6: (Optional) AI verdict ────────────────────────────────────────
+    # Uses the v2 SMC-aware prompt (spec R3 §2.8). Falls back gracefully if
+    # the AI module/keys are unavailable — never crashes the deep-dive.
     ai_verdict: Optional[Dict] = None
     if ai_provider and ai_api_key:
         try:
-            from qf_smc.ai_verdict import build_smc_prompt, get_verdict  # type: ignore
-            context = {
-                "symbol":          symbol,
-                "structure":       structure,
-                "fibo_zone":       fibo_zone,
-                "best_overall":    best_overall,
-                "best_per_entry":  best_per_entry,
-            }
-            prompt     = build_smc_prompt(context)
+            from qf_smc.ai_verdict import build_smc_prompt_v2, get_verdict  # type: ignore
+
+            # Derive HTF/LTF labels from structure metadata if present
+            _htf_label = str(structure.get("htf_tf", structure.get("htf_label", "?")))
+            _ltf_label = str(structure.get("ltf_tf", structure.get("ltf_label", "?")))
+
+            # current price: last close from df_htf
+            try:
+                _current_price = float(df_htf["close"].iloc[-1])
+            except Exception:
+                _current_price = 0.0
+
+            # wick adjustments live on the structure's swing metadata
+            _wick_adj = structure.get("wick_adjustments", []) or []
+
+            prompt = build_smc_prompt_v2(
+                symbol=symbol,
+                mode=str(structure.get("mode", "?")),
+                htf_label=_htf_label,
+                ltf_label=_ltf_label,
+                btc_regime=str(structure.get("btc_regime", "UNKNOWN")),
+                fights_macro=bool(structure.get("fights_macro", False)),
+                structure=structure,
+                fibo_zone=fibo_zone,
+                smart_obs=smart_obs,
+                fvgs=fvgs,
+                sr_levels=sr_levels,
+                wick_adjustments=_wick_adj,
+                ltf_confirmation=str(structure.get("ltf_confirmation", "NONE")),
+                variant_grid=df_72,
+                best_overall=best_overall or {},
+                current_price=_current_price,
+                scan_timestamp=datetime.utcnow().isoformat(),
+            )
             ai_verdict = get_verdict(prompt, provider=ai_provider, api_key=ai_api_key)
         except Exception as e:
-            ai_verdict = {"error": str(e)}
+            import traceback as _tb
+            print(f"[backtest] AI verdict error for {symbol}: {e}")
+            print(_tb.format_exc())
+            ai_verdict = {"error": f"{type(e).__name__}: {e}"}
 
     return {
         "symbol":                  symbol,
