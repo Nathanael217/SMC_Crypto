@@ -94,28 +94,55 @@ def run_scan(
     results: List[Dict[str, Any]] = []
 
     import traceback
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     error_log: List[Dict[str, str]] = []
-    for idx, symbol in enumerate(symbols):
-        if progress_callback:
-            progress_callback(idx + 1, len(symbols), symbol)
-        try:
-            result = scan_one_symbol(
-                symbol, mode, btc_regime,
-                atr_multiplier=atr_multiplier,
-                run_backtest=run_backtest,
-            )
-            if result is not None:
-                results.append(result)
-        except Exception as e:
-            tb = traceback.format_exc()
-            print(f"[scanner] error scanning {symbol}: {type(e).__name__}: {e}")
-            print(f"[scanner] traceback for {symbol}:\n{tb}")
-            error_log.append({"symbol": symbol, "error": f"{type(e).__name__}: {e}"})
-            continue
-    
+    total = len(symbols)
+
+    # Worker count: network-bound work benefits from oversubscription, but we
+    # cap at 8 to stay friendly to Binance rate limits and avoid thread churn.
+    max_workers = min(8, max(1, total))
+
+    def _worker(sym: str) -> Optional[Dict[str, Any]]:
+        """Run one symbol scan. Exceptions are caught and re-raised to the
+        future so the main loop can log them per-symbol."""
+        return scan_one_symbol(
+            sym, mode, btc_regime,
+            atr_multiplier=atr_multiplier,
+            run_backtest=run_backtest,
+        )
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all symbols
+        future_to_symbol = {
+            executor.submit(_worker, sym): sym for sym in symbols
+        }
+        # Collect as they finish (order doesn't matter — results get sorted later)
+        for future in as_completed(future_to_symbol):
+            symbol = future_to_symbol[future]
+            completed += 1
+            if progress_callback:
+                # progress_callback runs on the MAIN thread here (as_completed
+                # yields back to the caller's thread) — safe for Streamlit.
+                try:
+                    progress_callback(completed, total, symbol)
+                except Exception:
+                    pass  # never let a UI callback error kill the scan
+            try:
+                result = future.result()
+                if result is not None:
+                    results.append(result)
+            except Exception as e:
+                tb = traceback.format_exc()
+                print(f"[scanner] error scanning {symbol}: {type(e).__name__}: {e}")
+                print(f"[scanner] traceback for {symbol}:\n{tb}")
+                error_log.append({"symbol": symbol, "error": f"{type(e).__name__}: {e}"})
+                continue
+
     # If ALL symbols failed, surface the error count so UI can warn user
     if not results and error_log:
-        print(f"[scanner] ALL {len(symbols)} symbols failed. First 3 errors: {error_log[:3]}")
+        print(f"[scanner] ALL {total} symbols failed. First 3 errors: {error_log[:3]}")
 
     return results
 
@@ -172,8 +199,13 @@ def scan_one_symbol(
     lookback     = cfg["lookback"]
 
     # ── Step 1-2: Fetch candles ──────────────────────────────────────────────
-    # Deep fetch for HTF — gives variant grid meaningful history (≥200 bars)
-    df_htf = _scanner_fetch_candles(symbol, htf_interval, limit=500)
+    # HTF fetch depth depends on whether we will run the backtest:
+    #   - fast scan (run_backtest=False): 250 bars is plenty for structure
+    #     (pivot-5 swings) + zone detection. Smaller payload = faster.
+    #   - full scan (run_backtest=True): 500 bars gives the variant grid
+    #     meaningful history for the historical replay.
+    _htf_limit = 500 if run_backtest else 250
+    df_htf = _scanner_fetch_candles(symbol, htf_interval, limit=_htf_limit)
     df_ltf = _scanner_fetch_candles(symbol, ltf_interval, limit=lookback + 50)
 
     # ── Step 3: Validate data ────────────────────────────────────────────────
