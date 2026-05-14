@@ -69,6 +69,7 @@ def run_scan(
     symbols: List[str],
     btc_regime: str,
     atr_multiplier: float = 0.5,                              # NEW v1.2
+    run_backtest: bool = False,                               # NEW v1.2b — scan is fast by default
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -101,6 +102,7 @@ def run_scan(
             result = scan_one_symbol(
                 symbol, mode, btc_regime,
                 atr_multiplier=atr_multiplier,
+                run_backtest=run_backtest,
             )
             if result is not None:
                 results.append(result)
@@ -127,6 +129,7 @@ def scan_one_symbol(
     mode: str,
     btc_regime: str,
     atr_multiplier: float = 0.5,    # NEW v1.2
+    run_backtest: bool = False,     # NEW v1.2b — when False, skip 24-variant grid (fast scan)
 ) -> Optional[Dict[str, Any]]:
     """
     Full pipeline for ONE symbol.
@@ -241,39 +244,46 @@ def scan_one_symbol(
     ltf_signal_bar   = ltf_result.get("signal_bar")
 
     # ── Step 14: 24-variant backtest grid ─────────────────────────────────────
+    # v1.2b: by default the SCAN is FAST — it skips the backtest entirely.
+    # The full 24/72-variant grid is computed only when the user clicks the
+    # Deep Dive button (deep_dive_backtest runs its own grid).
     low_confidence = len(df_htf) < 100
 
-    try:
-        variant_grid: pd.DataFrame = run_variant_grid(
-            df_htf=df_htf,
-            df_ltf=df_ltf,
-            structure=structure,
-            fibo_zone=fibo_zone,
-            smart_obs=smart_obs,
-            fvgs=fvgs,
-            sr_levels=sr_levels,
-        )
-    except Exception as e:
-        import traceback as _tb
-        print(f"[scanner] {symbol}: run_variant_grid failed: {type(e).__name__}: {e}")
-        print(_tb.format_exc())
-        # Return empty grid so caller doesn't crash
-        variant_grid = pd.DataFrame(columns=[
-            "entry_type", "ltf_mode", "tp_R",
-            "n_setups", "n_filled", "n_wins",
-            "wr", "mean_r", "median_r", "pf", "max_dd_R",
-            "avg_entry_price", "avg_sl_pct", "avg_rr_to_tp",
-            "recent_check", "trades_raw",
-        ])
+    _EMPTY_GRID_COLS = [
+        "entry_type", "ltf_mode", "tp_R",
+        "n_setups", "n_filled", "n_wins",
+        "wr", "mean_r", "median_r", "pf", "max_dd_R",
+        "avg_entry_price", "avg_sl_pct", "avg_rr_to_tp",
+        "recent_check", "trades_raw",
+    ]
 
-    # Attach metadata flag for thin data
-    if low_confidence:
-        variant_grid["low_confidence"] = True
+    if run_backtest:
+        try:
+            variant_grid: pd.DataFrame = run_variant_grid(
+                df_htf=df_htf,
+                df_ltf=df_ltf,
+                structure=structure,
+                fibo_zone=fibo_zone,
+                smart_obs=smart_obs,
+                fvgs=fvgs,
+                sr_levels=sr_levels,
+            )
+        except Exception as e:
+            import traceback as _tb
+            print(f"[scanner] {symbol}: run_variant_grid failed: {type(e).__name__}: {e}")
+            print(_tb.format_exc())
+            variant_grid = pd.DataFrame(columns=_EMPTY_GRID_COLS)
 
-    # Best variant = row with highest profit factor
-    best_variant: Optional[Dict[str, Any]] = None
-    if not variant_grid.empty:
-        best_variant = variant_grid.iloc[0].to_dict()
+        if low_confidence and not variant_grid.empty:
+            variant_grid["low_confidence"] = True
+
+        best_variant: Optional[Dict[str, Any]] = None
+        if not variant_grid.empty:
+            best_variant = variant_grid.iloc[0].to_dict()
+    else:
+        # Fast scan path — no backtest. Empty grid; UI shows "Deep Dive for backtest".
+        variant_grid = pd.DataFrame(columns=_EMPTY_GRID_COLS)
+        best_variant = None
 
     # ── Step 15: Macro flag ───────────────────────────────────────────────────
     fights_macro = btc_regime in {"BEAR"}
