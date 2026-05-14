@@ -93,19 +93,29 @@ def run_scan(
     """
     results: List[Dict[str, Any]] = []
 
+    import time as _time
     import traceback
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 
     error_log: List[Dict[str, str]] = []
+    skipped_slow: List[str] = []
     total = len(symbols)
 
     # Worker count: network-bound work benefits from oversubscription, but we
     # cap at 8 to stay friendly to Binance rate limits and avoid thread churn.
     max_workers = min(8, max(1, total))
 
+    # ── Per-coin wall-clock budget ───────────────────────────────────────────
+    # A healthy coin completes structure+zone analysis in well under a second
+    # once its candles are fetched. The only thing that takes long is a slow /
+    # hung Binance API response. If a coin hasn't finished within this many
+    # seconds we ABANDON it: stop waiting, mark it skipped, move on. The
+    # orphaned worker thread finishes on its own in the background and its
+    # result is discarded.
+    PER_COIN_TIMEOUT = 12.0  # seconds — generous, but kills true anomalies
+
     def _worker(sym: str) -> Optional[Dict[str, Any]]:
-        """Run one symbol scan. Exceptions are caught and re-raised to the
-        future so the main loop can log them per-symbol."""
+        """Run one symbol scan. Exceptions propagate to the future."""
         return scan_one_symbol(
             sym, mode, btc_regime,
             atr_multiplier=atr_multiplier,
@@ -113,36 +123,86 @@ def run_scan(
         )
 
     completed = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all symbols
-        future_to_symbol = {
-            executor.submit(_worker, sym): sym for sym in symbols
-        }
-        # Collect as they finish (order doesn't matter — results get sorted later)
-        for future in as_completed(future_to_symbol):
-            symbol = future_to_symbol[future]
-            completed += 1
-            if progress_callback:
-                # progress_callback runs on the MAIN thread here (as_completed
-                # yields back to the caller's thread) — safe for Streamlit.
-                try:
-                    progress_callback(completed, total, symbol)
-                except Exception:
-                    pass  # never let a UI callback error kill the scan
-            try:
-                result = future.result()
-                if result is not None:
-                    results.append(result)
-            except Exception as e:
-                tb = traceback.format_exc()
-                print(f"[scanner] error scanning {symbol}: {type(e).__name__}: {e}")
-                print(f"[scanner] traceback for {symbol}:\n{tb}")
-                error_log.append({"symbol": symbol, "error": f"{type(e).__name__}: {e}"})
-                continue
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        # Submit everything up front. Record submit time per future so we can
+        # enforce a per-coin deadline.
+        future_to_symbol: Dict[Any, str] = {}
+        submit_time: Dict[Any, float] = {}
+        now0 = _time.monotonic()
+        for sym in symbols:
+            fut = executor.submit(_worker, sym)
+            future_to_symbol[fut] = sym
+            submit_time[fut] = now0  # all submitted ~now; pool runs 8 at a time
 
-    # If ALL symbols failed, surface the error count so UI can warn user
-    if not results and error_log:
-        print(f"[scanner] ALL {total} symbols failed. First 3 errors: {error_log[:3]}")
+        pending = set(future_to_symbol.keys())
+
+        # Poll loop: wait in short slices so we can (a) update progress smoothly
+        # and (b) reap any future that has blown past PER_COIN_TIMEOUT.
+        while pending:
+            done, pending = wait(pending, timeout=2.0, return_when=FIRST_COMPLETED)
+
+            # ── Handle finished futures ──────────────────────────────────────
+            for future in done:
+                symbol = future_to_symbol[future]
+                completed += 1
+                if progress_callback:
+                    try:
+                        progress_callback(completed, total, symbol)
+                    except Exception:
+                        pass
+                try:
+                    result = future.result()  # already done — won't block
+                    if result is not None:
+                        results.append(result)
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    print(f"[scanner] error scanning {symbol}: {type(e).__name__}: {e}")
+                    print(f"[scanner] traceback for {symbol}:\n{tb}")
+                    error_log.append({"symbol": symbol, "error": f"{type(e).__name__}: {e}"})
+
+            # ── Reap futures that have exceeded the per-coin budget ──────────
+            # A future can't realistically run until earlier ones free a worker
+            # slot, so we add grace proportional to how deep the queue still is.
+            now = _time.monotonic()
+            to_abandon = []
+            for future in list(pending):
+                age = now - submit_time[future]
+                queue_grace = (len(pending) / max_workers) * 2.0
+                if age > (PER_COIN_TIMEOUT + queue_grace):
+                    to_abandon.append(future)
+
+            for future in to_abandon:
+                symbol = future_to_symbol[future]
+                completed += 1
+                skipped_slow.append(symbol)
+                pending.discard(future)
+                # Do NOT call future.result() — that would block. Just stop
+                # tracking it; the orphaned worker thread finishes on its own
+                # (its short 5s HTTP timeout guarantees it ends soon) and the
+                # return value is garbage-collected. Try cancel in case it
+                # hasn't started (no-op if already running).
+                future.cancel()
+                if progress_callback:
+                    try:
+                        progress_callback(completed, total, f"{symbol} (skipped — slow)")
+                    except Exception:
+                        pass
+                print(f"[scanner] SKIPPED {symbol}: exceeded per-coin timeout "
+                      f"({PER_COIN_TIMEOUT}s budget) — likely slow/hung API response.")
+    finally:
+        # Non-blocking shutdown: return to the caller immediately. Any orphaned
+        # slow threads finish in the background — their short 5s HTTP timeout
+        # means they die within a few seconds and never delay the user.
+        executor.shutdown(wait=False)
+
+    # ── Summary logging ──────────────────────────────────────────────────────
+    if skipped_slow:
+        print(f"[scanner] {len(skipped_slow)} coin(s) skipped for slow response: "
+              f"{skipped_slow[:10]}{'...' if len(skipped_slow) > 10 else ''}")
+
+    if not results and (error_log or skipped_slow):
+        print(f"[scanner] No setups. errors={len(error_log)} skipped_slow={len(skipped_slow)}")
 
     return results
 
@@ -205,8 +265,15 @@ def scan_one_symbol(
     #   - full scan (run_backtest=True): 500 bars gives the variant grid
     #     meaningful history for the historical replay.
     _htf_limit = 500 if run_backtest else 250
-    df_htf = _scanner_fetch_candles(symbol, htf_interval, limit=_htf_limit)
-    df_ltf = _scanner_fetch_candles(symbol, ltf_interval, limit=lookback + 50)
+    # Short per-request timeout (5s): a slow/hung coin fails fast here instead
+    # of stalling the worker thread. run_scan's per-coin budget then skips it.
+    _fetch_timeout = 5.0
+    df_htf = _scanner_fetch_candles(
+        symbol, htf_interval, limit=_htf_limit, timeout=_fetch_timeout,
+    )
+    df_ltf = _scanner_fetch_candles(
+        symbol, ltf_interval, limit=lookback + 50, timeout=_fetch_timeout,
+    )
 
     # ── Step 3: Validate data ────────────────────────────────────────────────
     if df_htf is None or df_htf.empty or len(df_htf) < 30:
