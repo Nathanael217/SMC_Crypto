@@ -94,6 +94,7 @@ def run_scan(
     results: List[Dict[str, Any]] = []
 
     import time as _time
+    import threading as _threading
     import traceback
     from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 
@@ -101,21 +102,37 @@ def run_scan(
     skipped_slow: List[str] = []
     total = len(symbols)
 
+    if total == 0:
+        return results
+
     # Worker count: network-bound work benefits from oversubscription, but we
     # cap at 8 to stay friendly to Binance rate limits and avoid thread churn.
     max_workers = min(8, max(1, total))
 
-    # ── Per-coin wall-clock budget ───────────────────────────────────────────
-    # A healthy coin completes structure+zone analysis in well under a second
+    # ── Per-coin RUN-TIME budget ─────────────────────────────────────────────
+    # A healthy coin finishes structure+zone analysis in well under a second
     # once its candles are fetched. The only thing that takes long is a slow /
-    # hung Binance API response. If a coin hasn't finished within this many
-    # seconds we ABANDON it: stop waiting, mark it skipped, move on. The
-    # orphaned worker thread finishes on its own in the background and its
-    # result is discarded.
-    PER_COIN_TIMEOUT = 12.0  # seconds — generous, but kills true anomalies
+    # hung Binance API response.
+    #
+    # IMPORTANT: this budget is measured from when a worker ACTUALLY STARTS
+    # running that coin — NOT from when it was submitted. A coin still waiting
+    # in the queue for a free worker slot is not "slow", it just hasn't had a
+    # turn yet. Only a coin whose worker has been actively running longer than
+    # this budget is treated as hung and abandoned.
+    PER_COIN_TIMEOUT = 10.0  # seconds of actual run time
+
+    # Shared map: symbol -> monotonic time its worker started executing.
+    # Written by worker threads, read by the main reaper loop — guarded by a
+    # lock for safety.
+    start_times: Dict[str, float] = {}
+    start_lock = _threading.Lock()
 
     def _worker(sym: str) -> Optional[Dict[str, Any]]:
-        """Run one symbol scan. Exceptions propagate to the future."""
+        """Run one symbol scan. Records its own start time the moment it
+        begins, so the main loop can tell running-too-long from still-queued.
+        Exceptions propagate to the future for per-symbol logging."""
+        with start_lock:
+            start_times[sym] = _time.monotonic()
         return scan_one_symbol(
             sym, mode, btc_regime,
             atr_multiplier=atr_multiplier,
@@ -125,22 +142,15 @@ def run_scan(
     completed = 0
     executor = ThreadPoolExecutor(max_workers=max_workers)
     try:
-        # Submit everything up front. Record submit time per future so we can
-        # enforce a per-coin deadline.
-        future_to_symbol: Dict[Any, str] = {}
-        submit_time: Dict[Any, float] = {}
-        now0 = _time.monotonic()
-        for sym in symbols:
-            fut = executor.submit(_worker, sym)
-            future_to_symbol[fut] = sym
-            submit_time[fut] = now0  # all submitted ~now; pool runs 8 at a time
-
+        future_to_symbol: Dict[Any, str] = {
+            executor.submit(_worker, sym): sym for sym in symbols
+        }
         pending = set(future_to_symbol.keys())
 
         # Poll loop: wait in short slices so we can (a) update progress smoothly
-        # and (b) reap any future that has blown past PER_COIN_TIMEOUT.
+        # and (b) reap any future whose worker has been RUNNING past the budget.
         while pending:
-            done, pending = wait(pending, timeout=2.0, return_when=FIRST_COMPLETED)
+            done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
 
             # ── Handle finished futures ──────────────────────────────────────
             for future in done:
@@ -150,7 +160,7 @@ def run_scan(
                     try:
                         progress_callback(completed, total, symbol)
                     except Exception:
-                        pass
+                        pass  # never let a UI callback error kill the scan
                 try:
                     result = future.result()  # already done — won't block
                     if result is not None:
@@ -161,16 +171,18 @@ def run_scan(
                     print(f"[scanner] traceback for {symbol}:\n{tb}")
                     error_log.append({"symbol": symbol, "error": f"{type(e).__name__}: {e}"})
 
-            # ── Reap futures that have exceeded the per-coin budget ──────────
-            # A future can't realistically run until earlier ones free a worker
-            # slot, so we add grace proportional to how deep the queue still is.
+            # ── Reap futures whose worker has RUN too long ───────────────────
+            # Only abandon a future that (a) has actually started running and
+            # (b) has been running longer than PER_COIN_TIMEOUT. Futures still
+            # queued (no start time yet) are left alone.
             now = _time.monotonic()
             to_abandon = []
-            for future in list(pending):
-                age = now - submit_time[future]
-                queue_grace = (len(pending) / max_workers) * 2.0
-                if age > (PER_COIN_TIMEOUT + queue_grace):
-                    to_abandon.append(future)
+            with start_lock:
+                for future in list(pending):
+                    symbol = future_to_symbol[future]
+                    started_at = start_times.get(symbol)
+                    if started_at is not None and (now - started_at) > PER_COIN_TIMEOUT:
+                        to_abandon.append(future)
 
             for future in to_abandon:
                 symbol = future_to_symbol[future]
@@ -178,22 +190,22 @@ def run_scan(
                 skipped_slow.append(symbol)
                 pending.discard(future)
                 # Do NOT call future.result() — that would block. Just stop
-                # tracking it; the orphaned worker thread finishes on its own
-                # (its short 5s HTTP timeout guarantees it ends soon) and the
-                # return value is garbage-collected. Try cancel in case it
-                # hasn't started (no-op if already running).
+                # tracking it. The orphaned worker thread ends on its own (the
+                # 5s HTTP timeout in _scanner_fetch_candles guarantees it dies
+                # within seconds) and its return value is garbage-collected.
+                # cancel() is a no-op if it's already running, harmless if not.
                 future.cancel()
                 if progress_callback:
                     try:
-                        progress_callback(completed, total, f"{symbol} (skipped — slow)")
+                        progress_callback(completed, total, f"{symbol} (skipped \u2014 slow)")
                     except Exception:
                         pass
-                print(f"[scanner] SKIPPED {symbol}: exceeded per-coin timeout "
-                      f"({PER_COIN_TIMEOUT}s budget) — likely slow/hung API response.")
+                print(f"[scanner] SKIPPED {symbol}: worker ran >{PER_COIN_TIMEOUT}s "
+                      f"\u2014 slow/hung API response, coin dropped from results.")
     finally:
-        # Non-blocking shutdown: return to the caller immediately. Any orphaned
-        # slow threads finish in the background — their short 5s HTTP timeout
-        # means they die within a few seconds and never delay the user.
+        # Non-blocking shutdown: run_scan returns to the caller immediately.
+        # Any orphaned slow threads finish in the background; their short 5s
+        # HTTP timeout means they die within seconds and never delay the user.
         executor.shutdown(wait=False)
 
     # ── Summary logging ──────────────────────────────────────────────────────
@@ -202,7 +214,8 @@ def run_scan(
               f"{skipped_slow[:10]}{'...' if len(skipped_slow) > 10 else ''}")
 
     if not results and (error_log or skipped_slow):
-        print(f"[scanner] No setups. errors={len(error_log)} skipped_slow={len(skipped_slow)}")
+        print(f"[scanner] No setups. errors={len(error_log)} "
+              f"skipped_slow={len(skipped_slow)}")
 
     return results
 
