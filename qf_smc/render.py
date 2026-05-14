@@ -481,7 +481,11 @@ def render_deep_dive_results(result: Dict[str, Any]) -> None:
             st.warning(f"Could not render best-per-entry table: {e}")
 
     # ─── All 72 Variants ─────────────────────────────────────────────────────
-    all_72 = deep.get("all_72_variants") or deep.get("all_variants")
+    # NOTE: must NOT use `a or b` here — `a` is a DataFrame and
+    # `bool(DataFrame)` raises ValueError. Pick the first key explicitly.
+    all_72 = deep.get("all_72_variants")
+    if all_72 is None:
+        all_72 = deep.get("all_variants")
     if isinstance(all_72, pd.DataFrame) and not all_72.empty:
         with st.expander(
             f"\U0001f4cb All {len(all_72)} variants (sorted by PF)",
