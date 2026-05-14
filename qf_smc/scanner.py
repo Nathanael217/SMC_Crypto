@@ -92,6 +92,8 @@ def run_scan(
     """
     results: List[Dict[str, Any]] = []
 
+    import traceback
+    error_log: List[Dict[str, str]] = []
     for idx, symbol in enumerate(symbols):
         if progress_callback:
             progress_callback(idx + 1, len(symbols), symbol)
@@ -103,8 +105,15 @@ def run_scan(
             if result is not None:
                 results.append(result)
         except Exception as e:
-            print(f"[scanner] error scanning {symbol}: {e}")
+            tb = traceback.format_exc()
+            print(f"[scanner] error scanning {symbol}: {type(e).__name__}: {e}")
+            print(f"[scanner] traceback for {symbol}:\n{tb}")
+            error_log.append({"symbol": symbol, "error": f"{type(e).__name__}: {e}"})
             continue
+    
+    # If ALL symbols failed, surface the error count so UI can warn user
+    if not results and error_log:
+        print(f"[scanner] ALL {len(symbols)} symbols failed. First 3 errors: {error_log[:3]}")
 
     return results
 
@@ -234,15 +243,28 @@ def scan_one_symbol(
     # ── Step 14: 24-variant backtest grid ─────────────────────────────────────
     low_confidence = len(df_htf) < 100
 
-    variant_grid: pd.DataFrame = run_variant_grid(
-        df_htf=df_htf,
-        df_ltf=df_ltf,
-        structure=structure,
-        fibo_zone=fibo_zone,
-        smart_obs=smart_obs,
-        fvgs=fvgs,
-        sr_levels=sr_levels,
-    )
+    try:
+        variant_grid: pd.DataFrame = run_variant_grid(
+            df_htf=df_htf,
+            df_ltf=df_ltf,
+            structure=structure,
+            fibo_zone=fibo_zone,
+            smart_obs=smart_obs,
+            fvgs=fvgs,
+            sr_levels=sr_levels,
+        )
+    except Exception as e:
+        import traceback as _tb
+        print(f"[scanner] {symbol}: run_variant_grid failed: {type(e).__name__}: {e}")
+        print(_tb.format_exc())
+        # Return empty grid so caller doesn't crash
+        variant_grid = pd.DataFrame(columns=[
+            "entry_type", "ltf_mode", "tp_R",
+            "n_setups", "n_filled", "n_wins",
+            "wr", "mean_r", "median_r", "pf", "max_dd_R",
+            "avg_entry_price", "avg_sl_pct", "avg_rr_to_tp",
+            "recent_check", "trades_raw",
+        ])
 
     # Attach metadata flag for thin data
     if low_confidence:

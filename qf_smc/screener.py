@@ -724,7 +724,11 @@ def render_screener_table(
     style = df_display.style
     for col in pct_cols:
         if col in df_display.columns:
-            style = style.applymap(_color_pct_str, subset=[col])
+            try:
+                style = style.map(_color_pct_str, subset=[col])
+            except AttributeError:
+                # pandas < 2.1.0 fallback
+                style = style.applymap(_color_pct_str, subset=[col])
 
     st.dataframe(style, use_container_width=True, hide_index=True)
 
