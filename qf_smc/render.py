@@ -230,10 +230,11 @@ def render_signal_card_detail_v2(
                     )
 
         # ─── 24-Variant Backtest Summary ─────────────────────────────────────
-        st.markdown("**\U0001f4ca Backtest: 24 Entry Variants (sorted by PF)**")
         variant_grid = result.get("variant_grid")
+        _has_grid = isinstance(variant_grid, pd.DataFrame) and not variant_grid.empty
 
-        if isinstance(variant_grid, pd.DataFrame) and not variant_grid.empty:
+        if _has_grid:
+            st.markdown("**\U0001f4ca Backtest: 24 Entry Variants (sorted by PF)**")
             top_5 = variant_grid.head(5)
             display_cols = [c for c in
                 ["entry_type", "ltf_mode", "tp_R", "wr", "pf", "mean_r", "n_setups"]
@@ -242,6 +243,7 @@ def render_signal_card_detail_v2(
                 _format_variant_df(top_5[display_cols]),
                 hide_index=True,
                 use_container_width=True,
+                height=220,
             )
             with st.expander("\U0001f4cb Show all 24 variants", expanded=False):
                 display_all_cols = [c for c in
@@ -251,30 +253,35 @@ def render_signal_card_detail_v2(
                     _format_variant_df(variant_grid[display_all_cols]),
                     hide_index=True,
                     use_container_width=True,
+                    height=400,
                 )
         else:
-            st.warning(
-                "No variant grid data. Run a deep-dive scan or ensure backtest.py "
-                "is at v1.2 (run_variant_grid returns a DataFrame)."
+            # Fast-scan mode: backtest was skipped to keep the scan quick.
+            st.info(
+                "\u26a1 **Fast scan** \u2014 structure + zone validated. "
+                "Click **\U0001f50d Deep Dive** below to run the full "
+                "24/72-variant backtest for this coin."
             )
 
         # ─── Recommended Trade Plan (best variant) ───────────────────────────
+        # Compact one-line layout — avoids the tall st.metric() blocks that
+        # were getting clipped inside the expander.
         best_variant = result.get("best_variant")
         if best_variant:
             st.markdown("**\U0001f3af Recommended Setup (Best Variant by PF)**")
-            bv_cols = st.columns(3)
-            with bv_cols[0]:
-                st.text(f"Entry type: {best_variant.get('entry_type', '?')}")
-                st.text(f"LTF mode:   {best_variant.get('ltf_mode', '?')}")
-                st.text(f"TP\u00d7R:       {best_variant.get('tp_R', '?')}")
-            with bv_cols[1]:
-                pf_val = best_variant.get("pf", 0)
-                pf_display = "\u221e" if pf_val == float("inf") else f"{float(pf_val):.2f}"
-                st.metric("PF",     pf_display)
-                st.metric("WR",     f"{float(best_variant.get('wr', 0)):.0%}")
-            with bv_cols[2]:
-                st.metric("Mean R", f"{float(best_variant.get('mean_r', 0)):+.3f}")
-                st.metric("n setups", f"{best_variant.get('n_setups', 0)}")
+            _pf_val = best_variant.get("pf", 0)
+            _pf_disp = "\u221e" if _pf_val == float("inf") else f"{float(_pf_val):.2f}"
+            st.text(
+                f"  {best_variant.get('entry_type', '?')} / "
+                f"LTF-{best_variant.get('ltf_mode', '?')} / "
+                f"TP {best_variant.get('tp_R', '?')}R"
+            )
+            st.text(
+                f"  PF {_pf_disp}  |  "
+                f"WR {float(best_variant.get('wr', 0)):.0%}  |  "
+                f"Mean R {float(best_variant.get('mean_r', 0)):+.3f}  |  "
+                f"n={best_variant.get('n_setups', 0)}"
+            )
 
         # ─── Tier Tooltips ───────────────────────────────────────────────────
         if ob_tier or ema_tier:
@@ -309,9 +316,16 @@ def render_signal_card_detail_v2(
             ):
                 st.session_state[deep_dive_key] = True
 
-            # If deep-dive was triggered, render it
-            if st.session_state.get(deep_dive_key):
-                render_deep_dive_results(result)
+    # ─── Deep-Dive Results (rendered OUTSIDE the expander) ───────────────────
+    # IMPORTANT: this must NOT be nested inside the `with st.expander` block
+    # above — deeply nested content gets visually clipped in Streamlit. By
+    # rendering here, at the function's top indentation level, the full
+    # deep-dive output (AI verdict, tables, trade plan) displays cleanly
+    # below the card.
+    if allow_deep_dive:
+        deep_dive_key = f"deep_dive_{symbol}"
+        if st.session_state.get(deep_dive_key):
+            render_deep_dive_results(result)
 
 
 # ============================================================================
@@ -476,7 +490,12 @@ def render_deep_dive_results(result: Dict[str, Any]) -> None:
                     "Mean R":     f"{float(br.get('mean_r', 0)):+.3f}",
                     "n":          br.get("n_setups", 0),
                 })
-            st.dataframe(pd.DataFrame(bpe_rows), hide_index=True, use_container_width=True)
+            st.dataframe(
+                pd.DataFrame(bpe_rows),
+                hide_index=True,
+                use_container_width=True,
+                height=220,
+            )
         except Exception as e:
             st.warning(f"Could not render best-per-entry table: {e}")
 
@@ -498,4 +517,5 @@ def render_deep_dive_results(result: Dict[str, Any]) -> None:
                 _format_variant_df(all_72[show_cols]),
                 hide_index=True,
                 use_container_width=True,
+                height=400,
             )
