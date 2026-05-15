@@ -95,44 +95,39 @@ def run_scan(
 
     import time as _time
     import threading as _threading
-    import traceback
-    from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
+    import traceback as _traceback
+    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
-    error_log: List[Dict[str, str]] = []
-    skipped_slow: List[str] = []
     total = len(symbols)
-
     if total == 0:
         return results
 
-    # Worker count: network-bound work benefits from oversubscription, but we
-    # cap at 8 to stay friendly to Binance rate limits and avoid thread churn.
-    max_workers = min(8, max(1, total))
-
-    # ── Per-coin RUN-TIME budget ─────────────────────────────────────────────
-    # A healthy coin finishes structure+zone analysis in well under a second
-    # once its candles are fetched. The only thing that takes long is a slow /
-    # hung Binance API response.
+    # ── HARD per-coin timeout ────────────────────────────────────────────────
+    # The ONLY thing that ever takes long is a slow / hung Binance API call.
+    # A coin whose worker has been RUNNING (not just queued) longer than this
+    # is abandoned: the scan drops it and moves on. Slow coins can never block.
     #
-    # IMPORTANT: this budget is measured from when a worker ACTUALLY STARTS
-    # running that coin — NOT from when it was submitted. A coin still waiting
-    # in the queue for a free worker slot is not "slow", it just hasn't had a
-    # turn yet. Only a coin whose worker has been actively running longer than
-    # this budget is treated as hung and abandoned.
+    # Measured from when the worker ACTUALLY STARTED running this coin — a coin
+    # still waiting in the queue for a free worker is not "slow", so it is
+    # never wrongly skipped.
     PER_COIN_TIMEOUT = 10.0  # seconds of actual run time
 
-    # Shared map: symbol -> monotonic time its worker started executing.
-    # Written by worker threads, read by the main reaper loop — guarded by a
-    # lock for safety.
-    start_times: Dict[str, float] = {}
-    start_lock = _threading.Lock()
+    # 8 workers: the work is network-bound (2 HTTP calls per coin), so threads
+    # overlap their waiting. Capped at 8 to stay friendly to Binance.
+    max_workers = min(8, max(1, total))
+
+    skipped_slow: list = []
+
+    # symbol -> monotonic time its worker began executing. Written by worker
+    # threads, read by the main reaper loop — guarded by a lock.
+    _start_times: Dict[str, float] = {}
+    _start_lock = _threading.Lock()
 
     def _worker(sym: str) -> Optional[Dict[str, Any]]:
-        """Run one symbol scan. Records its own start time the moment it
-        begins, so the main loop can tell running-too-long from still-queued.
-        Exceptions propagate to the future for per-symbol logging."""
-        with start_lock:
-            start_times[sym] = _time.monotonic()
+        # Record the real start time so the reaper can tell running-too-long
+        # apart from still-waiting-in-queue.
+        with _start_lock:
+            _start_times[sym] = _time.monotonic()
         return scan_one_symbol(
             sym, mode, btc_regime,
             atr_multiplier=atr_multiplier,
@@ -147,12 +142,12 @@ def run_scan(
         }
         pending = set(future_to_symbol.keys())
 
-        # Poll loop: wait in short slices so we can (a) update progress smoothly
-        # and (b) reap any future whose worker has been RUNNING past the budget.
+        # Poll in short slices: update progress smoothly AND reap any worker
+        # that has been running past the per-coin budget.
         while pending:
             done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
 
-            # ── Handle finished futures ──────────────────────────────────────
+            # ── finished futures ─────────────────────────────────────────────
             for future in done:
                 symbol = future_to_symbol[future]
                 completed += 1
@@ -160,27 +155,23 @@ def run_scan(
                     try:
                         progress_callback(completed, total, symbol)
                     except Exception:
-                        pass  # never let a UI callback error kill the scan
+                        pass  # a UI callback error must never kill the scan
                 try:
-                    result = future.result()  # already done — won't block
+                    result = future.result()  # already done — never blocks
                     if result is not None:
                         results.append(result)
                 except Exception as e:
-                    tb = traceback.format_exc()
-                    print(f"[scanner] error scanning {symbol}: {type(e).__name__}: {e}")
-                    print(f"[scanner] traceback for {symbol}:\n{tb}")
-                    error_log.append({"symbol": symbol, "error": f"{type(e).__name__}: {e}"})
+                    print(f"[scanner] error scanning {symbol}: "
+                          f"{type(e).__name__}: {e}")
+                    print(_traceback.format_exc())
 
-            # ── Reap futures whose worker has RUN too long ───────────────────
-            # Only abandon a future that (a) has actually started running and
-            # (b) has been running longer than PER_COIN_TIMEOUT. Futures still
-            # queued (no start time yet) are left alone.
+            # ── reap workers that have RUN too long ──────────────────────────
             now = _time.monotonic()
             to_abandon = []
-            with start_lock:
+            with _start_lock:
                 for future in list(pending):
                     symbol = future_to_symbol[future]
-                    started_at = start_times.get(symbol)
+                    started_at = _start_times.get(symbol)
                     if started_at is not None and (now - started_at) > PER_COIN_TIMEOUT:
                         to_abandon.append(future)
 
@@ -189,33 +180,25 @@ def run_scan(
                 completed += 1
                 skipped_slow.append(symbol)
                 pending.discard(future)
-                # Do NOT call future.result() — that would block. Just stop
-                # tracking it. The orphaned worker thread ends on its own (the
-                # 5s HTTP timeout in _scanner_fetch_candles guarantees it dies
-                # within seconds) and its return value is garbage-collected.
-                # cancel() is a no-op if it's already running, harmless if not.
+                # Do NOT call future.result() — it would block. Just stop
+                # tracking it. The orphaned thread ends on its own; its return
+                # value is discarded. cancel() is a harmless no-op if running.
                 future.cancel()
                 if progress_callback:
                     try:
                         progress_callback(completed, total, f"{symbol} (skipped \u2014 slow)")
                     except Exception:
                         pass
-                print(f"[scanner] SKIPPED {symbol}: worker ran >{PER_COIN_TIMEOUT}s "
-                      f"\u2014 slow/hung API response, coin dropped from results.")
+                print(f"[scanner] SKIPPED {symbol}: worker ran > {PER_COIN_TIMEOUT}s "
+                      f"\u2014 slow/hung response, coin dropped from results.")
     finally:
-        # Non-blocking shutdown: run_scan returns to the caller immediately.
-        # Any orphaned slow threads finish in the background; their short 5s
-        # HTTP timeout means they die within seconds and never delay the user.
+        # Non-blocking shutdown: run_scan returns immediately. Any orphaned
+        # slow threads finish in the background and never delay the user.
         executor.shutdown(wait=False)
 
-    # ── Summary logging ──────────────────────────────────────────────────────
     if skipped_slow:
         print(f"[scanner] {len(skipped_slow)} coin(s) skipped for slow response: "
-              f"{skipped_slow[:10]}{'...' if len(skipped_slow) > 10 else ''}")
-
-    if not results and (error_log or skipped_slow):
-        print(f"[scanner] No setups. errors={len(error_log)} "
-              f"skipped_slow={len(skipped_slow)}")
+              f"{skipped_slow[:15]}{'...' if len(skipped_slow) > 15 else ''}")
 
     return results
 
@@ -229,7 +212,7 @@ def scan_one_symbol(
     mode: str,
     btc_regime: str,
     atr_multiplier: float = 0.5,    # NEW v1.2
-    run_backtest: bool = False,     # NEW v1.2b — when False, skip 24-variant grid (fast scan)
+    run_backtest: bool = False,     # NEW v1.2b — False = fast scan, skip 24-variant grid
 ) -> Optional[Dict[str, Any]]:
     """
     Full pipeline for ONE symbol.
@@ -272,21 +255,9 @@ def scan_one_symbol(
     lookback     = cfg["lookback"]
 
     # ── Step 1-2: Fetch candles ──────────────────────────────────────────────
-    # HTF fetch depth depends on whether we will run the backtest:
-    #   - fast scan (run_backtest=False): 250 bars is plenty for structure
-    #     (pivot-5 swings) + zone detection. Smaller payload = faster.
-    #   - full scan (run_backtest=True): 500 bars gives the variant grid
-    #     meaningful history for the historical replay.
-    _htf_limit = 500 if run_backtest else 250
-    # Short per-request timeout (5s): a slow/hung coin fails fast here instead
-    # of stalling the worker thread. run_scan's per-coin budget then skips it.
-    _fetch_timeout = 5.0
-    df_htf = _scanner_fetch_candles(
-        symbol, htf_interval, limit=_htf_limit, timeout=_fetch_timeout,
-    )
-    df_ltf = _scanner_fetch_candles(
-        symbol, ltf_interval, limit=lookback + 50, timeout=_fetch_timeout,
-    )
+    # Deep fetch for HTF — gives variant grid meaningful history (≥200 bars)
+    df_htf = _scanner_fetch_candles(symbol, htf_interval, limit=500)
+    df_ltf = _scanner_fetch_candles(symbol, ltf_interval, limit=lookback + 50)
 
     # ── Step 3: Validate data ────────────────────────────────────────────────
     if df_htf is None or df_htf.empty or len(df_htf) < 30:
@@ -356,9 +327,10 @@ def scan_one_symbol(
     ltf_signal_bar   = ltf_result.get("signal_bar")
 
     # ── Step 14: 24-variant backtest grid ─────────────────────────────────────
-    # v1.2b: by default the SCAN is FAST — it skips the backtest entirely.
-    # The full 24/72-variant grid is computed only when the user clicks the
-    # Deep Dive button (deep_dive_backtest runs its own grid).
+    # v1.2b: the SCAN is FAST by default — it does structure + zone detection
+    # only and SKIPS the expensive 24-variant backtest. The full backtest is
+    # deferred to the Deep Dive button (backtest.deep_dive_backtest), which
+    # runs its own grid on demand for the single coin the user picks.
     low_confidence = len(df_htf) < 100
 
     _EMPTY_GRID_COLS = [
@@ -370,30 +342,24 @@ def scan_one_symbol(
     ]
 
     if run_backtest:
-        try:
-            variant_grid: pd.DataFrame = run_variant_grid(
-                df_htf=df_htf,
-                df_ltf=df_ltf,
-                structure=structure,
-                fibo_zone=fibo_zone,
-                smart_obs=smart_obs,
-                fvgs=fvgs,
-                sr_levels=sr_levels,
-            )
-        except Exception as e:
-            import traceback as _tb
-            print(f"[scanner] {symbol}: run_variant_grid failed: {type(e).__name__}: {e}")
-            print(_tb.format_exc())
-            variant_grid = pd.DataFrame(columns=_EMPTY_GRID_COLS)
-
+        # Full path — used only if a caller explicitly asks for the grid.
+        variant_grid: pd.DataFrame = run_variant_grid(
+            df_htf=df_htf,
+            df_ltf=df_ltf,
+            structure=structure,
+            fibo_zone=fibo_zone,
+            smart_obs=smart_obs,
+            fvgs=fvgs,
+            sr_levels=sr_levels,
+        )
         if low_confidence and not variant_grid.empty:
             variant_grid["low_confidence"] = True
-
         best_variant: Optional[Dict[str, Any]] = None
         if not variant_grid.empty:
             best_variant = variant_grid.iloc[0].to_dict()
     else:
-        # Fast scan path — no backtest. Empty grid; UI shows "Deep Dive for backtest".
+        # Fast scan — no backtest. Empty grid; the UI shows a "Deep Dive for
+        # backtest" message and the Deep Dive button runs the real grid.
         variant_grid = pd.DataFrame(columns=_EMPTY_GRID_COLS)
         best_variant = None
 
@@ -446,16 +412,17 @@ def scan_one_symbol(
         "ltf_signal_bar":   ltf_signal_bar,
 
         # ── backtest (v1.2: variant grid replaces single backtest) ─────────────
-        "variant_grid":        variant_grid,      # pd.DataFrame 24 rows
-        "best_variant":        best_variant,       # dict: row with highest PF
+        "variant_grid":        variant_grid,      # pd.DataFrame (empty on fast scan)
+        "best_variant":        best_variant,       # dict or None (None on fast scan)
         "deep_dive_available": True,               # UI deep-dive button flag
+
+        # ── candle cache for Deep Dive (render.py needs these to run the
+        #    full backtest on demand — see render.py render_deep_dive_results)
+        "_df_htf_cache": df_htf,
+        "_df_ltf_cache": df_ltf,
 
         # ── trade plan ────────────────────────────────────────────────────────
         "trade_plan": trade_plan,
-
-        # ── df cache for deep-dive (NEW v1.2 — required by render.py) ─────────
-        "_df_htf_cache": df_htf,
-        "_df_ltf_cache": df_ltf,
 
         # ── metadata ──────────────────────────────────────────────────────────
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
