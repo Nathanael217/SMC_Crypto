@@ -34,7 +34,11 @@ from qf_shared import (
     _clean_df,
 )
 from qf_smc.structure import detect_swings   # direction-neutral, reused
-from qf_smc_short.structure import classify_structure_short, is_downtrend_confirmed
+from qf_smc_short.structure import (
+    classify_structure_short,
+    is_downtrend_confirmed,
+    find_hierarchical_views_short,   # NEW: Session 2 — hierarchical views
+)
 from qf_smc_short.zones import (
     detect_smart_obs_short,
     detect_fvgs_short,
@@ -42,6 +46,7 @@ from qf_smc_short.zones import (
     detect_sr_levels_short,
     classify_current_price_in_zones_short,
 )
+# pick_primary_zone_short is defined locally below (not in zones.py)
 
 
 # ============================================================================
@@ -49,9 +54,12 @@ from qf_smc_short.zones import (
 # ============================================================================
 
 MODE_CONFIG: Dict[str, Dict[str, Any]] = {
-    "SWING": {"htf": "1d",  "ltf": "4h",  "lookback": 50, "htf_label": "1D", "ltf_label": "4H"},
-    "DAY":   {"htf": "4h",  "ltf": "15m", "lookback": 50, "htf_label": "4H", "ltf_label": "15m"},
-    "SCALP": {"htf": "1h",  "ltf": "5m",  "lookback": 50, "htf_label": "1H", "ltf_label": "5m"},
+    # lookback raised from 50 → 100 (Session 2): deeper structural context
+    # is required for find_hierarchical_views_short() to reliably identify
+    # both BROAD and NARROW legs across multiple market cycles.
+    "SWING": {"htf": "1d",  "ltf": "4h",  "lookback": 100, "htf_label": "1D", "ltf_label": "4H"},
+    "DAY":   {"htf": "4h",  "ltf": "15m", "lookback": 100, "htf_label": "4H", "ltf_label": "15m"},
+    "SCALP": {"htf": "1h",  "ltf": "5m",  "lookback": 100, "htf_label": "1H", "ltf_label": "5m"},
 }
 
 
@@ -65,6 +73,7 @@ def run_scan_short(
     btc_regime: str,
     atr_multiplier: float = 0.5,
     run_backtest: bool = False,        # Phase 2 — opt-in 24-variant grid
+    min_bounce_pct: float = 0.236,     # NEW (Session 2): minimum retracement to qualify a leg
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -113,6 +122,7 @@ def run_scan_short(
                 btc_regime=btc_regime,
                 atr_multiplier=atr_multiplier,
                 run_backtest=run_backtest,
+                min_bounce_pct=min_bounce_pct,
             )
         except Exception:
             return None
@@ -179,12 +189,109 @@ def run_scan_short(
     return results
 
 
+# ============================================================================
+# SESSION 2 HELPERS — per-view zone computation + tradeability check
+# ============================================================================
+
+def _compute_view_zone_data(
+    df_htf: pd.DataFrame,
+    broad_or_narrow_leg: Optional[Dict[str, Any]],
+    atr_multiplier: float,
+) -> Optional[Dict[str, Any]]:
+    """
+    Compute fibo_zone + smart_obs + fvgs + sr_levels + retracement_status
+    for ONE hierarchical view leg (either broad or narrow).
+
+    Returns a dict with all zone data, or None if the leg is None or the
+    Fibo zone calculation fails.
+    """
+    if broad_or_narrow_leg is None:
+        return None
+
+    # Build a structure-compatible dict so zones.py functions work unchanged
+    structure_for_view: Dict[str, Any] = {
+        "state": "BOS",   # treat any valid view leg as BOS-equivalent
+        "current_leg": broad_or_narrow_leg,
+        "choch_bar": None,
+        "bos_bar": broad_or_narrow_leg["leg_low_bar"],
+        "overall_bearish_verified": True,
+        "reason": "Hierarchical view leg",
+    }
+
+    fibo_zone = detect_fibo_levels_short(df_htf, structure_for_view,
+                                         atr_multiplier=atr_multiplier)
+    if not fibo_zone:
+        return None
+
+    smart_obs = detect_smart_obs_short(df_htf, structure_for_view,
+                                       fibo_786_zone=fibo_zone,
+                                       require_in_zone=True)
+    fvgs      = detect_fvgs_short(df_htf, structure_for_view,
+                                  fibo_786_zone=fibo_zone,
+                                  require_in_zone=True)
+    sr_levels = detect_sr_levels_short(df_htf, lookback=100,
+                                       fibo_786_zone=fibo_zone,
+                                       require_in_zone=True)
+
+    current_price = float(df_htf["close"].iloc[-1])
+
+    # Retracement gate — classify where price sits relative to the 0.786 zone
+    fib_618  = fibo_zone.get("fib_618", 0)
+    fib_786  = fibo_zone.get("fib_786", 0)
+    fib_886  = fibo_zone.get("fib_886", 0)
+    zone_top = fibo_zone.get("fib_786_zone_top",    fib_786 * 1.005)
+    zone_bot = fibo_zone.get("fib_786_zone_bottom", fib_786 * 0.995)
+
+    if current_price < fib_618:
+        retracement_status = "WAITING"
+    elif current_price < zone_bot:
+        retracement_status = "APPROACHING"
+    elif zone_bot <= current_price <= zone_top:
+        retracement_status = "ACTIONABLE"
+    elif zone_top < current_price <= fib_886:
+        retracement_status = "OVERSHOOT"
+    else:
+        retracement_status = "INVALIDATED"
+
+    zone_cls     = classify_current_price_in_zones_short(
+        current_price, smart_obs, fvgs, fibo_zone, sr_levels)
+    primary_zone = pick_primary_zone_short(zone_cls, fibo=fibo_zone)
+
+    return {
+        "leg":                broad_or_narrow_leg,
+        "fibo_zone":          fibo_zone,
+        "smart_obs":          smart_obs,
+        "fvgs":               fvgs,
+        "sr_levels":          sr_levels,
+        "current_price":      current_price,
+        "retracement_status": retracement_status,
+        "zone_classification": zone_cls,
+        "primary_zone":       primary_zone,
+        "fib_786":            fib_786,
+        "fib_618":            fib_618,
+        "zone_bot":           zone_bot,
+        "zone_top":           zone_top,
+    }
+
+
+def _is_view_tradeable(view_data: Optional[Dict[str, Any]]) -> bool:
+    """Return True only if this view has an actionable/overshoot retracement AND a primary zone."""
+    if view_data is None:
+        return False
+    if view_data["retracement_status"] not in {"ACTIONABLE", "OVERSHOOT"}:
+        return False
+    if view_data["primary_zone"] is None:
+        return False
+    return True
+
+
 def scan_one_symbol_short(
     symbol: str,
     mode: str,
     btc_regime: str,
     atr_multiplier: float = 0.5,
     run_backtest: bool = False,
+    min_bounce_pct: float = 0.236,     # NEW (Session 2): minimum bounce % to qualify a hierarchical leg
 ) -> Optional[Dict[str, Any]]:
     """
     Scan ONE symbol for a SHORT setup. Returns None if filters fail.
@@ -212,73 +319,98 @@ def scan_one_symbol_short(
     df_htf = df_htf.reset_index(drop=True)
     df_ltf = df_ltf.reset_index(drop=True)
 
-    # ── Step 2: Structure detection on HTF (SHORT classifier) ───────────────
-    swings    = detect_swings(df_htf, pivot=5)
-    structure = classify_structure_short(swings, df_htf)
+    # ── Step 2: Structure + hierarchical views on HTF ───────────────────────
+    swings          = detect_swings(df_htf, pivot=5)
+    structure_legacy = classify_structure_short(swings, df_htf)
+    views           = find_hierarchical_views_short(swings, df_htf,
+                                                    min_bounce_pct=min_bounce_pct)
 
-    # ── Step 3: Structure filter — must be confirmed downtrend ─────────────
-    if not is_downtrend_confirmed(structure):
+    broad_leg = views.get("broad")
+    narrow_leg = views.get("narrow")
+
+    # ── Step 3: Stop condition — broad LH broken means trend reversed ────────
+    if views.get("broad_invalidated"):
         return None
 
-    # ── Step 4: Fibo zone FIRST ─────────────────────────────────────────────
-    fibo_zone = detect_fibo_levels_short(df_htf, structure, atr_multiplier=atr_multiplier)
-    if not fibo_zone:
+    # If no valid broad AND no valid narrow → no setup
+    if broad_leg is None and narrow_leg is None:
         return None
 
-    # ── Step 5: Zone detectors WITH Fibo 0.786 filter ───────────────────────
-    smart_obs = detect_smart_obs_short(df_htf, structure, fibo_786_zone=fibo_zone, require_in_zone=True)
-    fvgs      = detect_fvgs_short(df_htf, structure, fibo_786_zone=fibo_zone, require_in_zone=True)
-    sr_levels = detect_sr_levels_short(df_htf, lookback=lookback, fibo_786_zone=fibo_zone, require_in_zone=True)
+    # ── Step 4: Compute zone data independently per view ────────────────────
+    broad_data  = _compute_view_zone_data(df_htf, broad_leg,  atr_multiplier)
+    narrow_data = _compute_view_zone_data(df_htf, narrow_leg, atr_multiplier)
 
-    # ── Step 6: Require at least one zone inside Fibo 0.786 ─────────────────
-    if not smart_obs and not fvgs and not sr_levels:
-        if "fib_786_zone_top" not in fibo_zone:
-            return None
-        # Fall through — price-into-fibo zone is itself the trigger
+    # ── Step 5: View selection — prefer BROAD, fall back to NARROW ──────────
+    view_used      = None
+    view_data_used = None
 
-    # ── Step 7: EMA tier (SHORT — must be BELOW EMAs) ───────────────────────
-    current_price = float(df_htf["close"].iloc[-1])
+    if _is_view_tradeable(broad_data):
+        view_used      = "BROAD"
+        view_data_used = broad_data
+    elif _is_view_tradeable(narrow_data):
+        view_used      = "NARROW"
+        view_data_used = narrow_data
+
+    # Return non-None only if at least one view is APPROACHING / ACTIONABLE /
+    # OVERSHOOT (so the UI can display the approaching-zone warning card).
+    has_any_view_in_play = False
+    for vd in (broad_data, narrow_data):
+        if vd and vd["retracement_status"] in {"ACTIONABLE", "OVERSHOOT", "APPROACHING"}:
+            has_any_view_in_play = True
+            break
+
+    if not has_any_view_in_play:
+        return None   # WAITING across both views → nothing worth showing
+
+    # ── Resolve the active view for downstream steps ─────────────────────────
+    # If no tradeable view yet (only APPROACHING), use best available for
+    # EMA / LTF / trade-plan logic but the result is marked not-yet-tradeable.
+    active = view_data_used or broad_data or narrow_data
+
+    fibo_zone     = active["fibo_zone"]
+    smart_obs     = active["smart_obs"]
+    fvgs          = active["fvgs"]
+    sr_levels     = active["sr_levels"]
+    current_price = active["current_price"]
+    zone_cls      = active["zone_classification"]
+    primary_zone  = active["primary_zone"]
+
+    # ── Step 6: EMA tier (SHORT — must be BELOW EMAs) ───────────────────────
     ema_tier = classify_ema_tier_short(df_htf, current_price)
     if ema_tier == "SKIP":
         return None
 
-    # ── Step 8: Zone classification ─────────────────────────────────────────
-    zone_cls = classify_current_price_in_zones_short(
-        current_price, smart_obs, fvgs, fibo_zone, sr_levels
-    )
-
-    # ── Step 9: Require actionable zone ─────────────────────────────────────
-    if not zone_cls.get("any", False):
-        return None
-
-    # ── Step 10: Pick primary zone (same priority logic, bearish content) ──
-    primary_zone = pick_primary_zone_short(zone_cls, fibo=fibo_zone)
-    if primary_zone is None:
-        return None
+    # ── Step 7: Require actionable zone (only when a tradeable view exists) ──
+    if view_data_used is not None:
+        if not zone_cls.get("any", False):
+            return None
+        if primary_zone is None:
+            return None
 
     ob_tier: Optional[str] = None
-    if primary_zone["type"] == "smart_ob":
+    if primary_zone is not None and primary_zone["type"] == "smart_ob":
         ob_tier = primary_zone["data"].get("tier")
 
-    # ── Step 11: LTF confirmation (bearish) ─────────────────────────────────
-    ltf_result       = check_ltf_confirmation_short(df_ltf, primary_zone)
+    # ── Step 8: LTF confirmation (bearish) ──────────────────────────────────
+    ltf_result       = check_ltf_confirmation_short(df_ltf, primary_zone) \
+                       if primary_zone is not None \
+                       else {"status": "NONE", "signal_bar": None}
     ltf_confirmation = ltf_result["status"]
     ltf_signal_bar   = ltf_result.get("signal_bar")
 
-    # ── Step 12: Macro flag — shorts fight BULL regime ──────────────────────
+    # ── Step 9: Macro flag — shorts fight BULL regime ───────────────────────
     fights_macro = btc_regime in {"BULL"}
 
-    # ── Step 13: Trade plan (SHORT) ─────────────────────────────────────────
-    trade_plan = build_trade_plan_short(primary_zone, current_price, df_htf, structure)
+    # ── Step 10: Trade plan (SHORT) ──────────────────────────────────────────
+    trade_plan = build_trade_plan_short(primary_zone, current_price, df_htf,
+                                        structure_legacy) \
+                 if primary_zone is not None \
+                 else {}
 
-    # ── Step 14: Transparency fields ────────────────────────────────────────
-    wick_adjustments         = swings.get("wick_adjustments", [])
-    overall_bearish_verified = structure.get("overall_bearish_verified", False)
+    # ── Step 11: Transparency fields ─────────────────────────────────────────
+    wick_adjustments = swings.get("wick_adjustments", [])
 
-    # ── Step 14b: Optional 24-variant backtest grid (Phase 2) ───────────────
-    # v1.0 / Phase 2: the scan is FAST by default (run_backtest=False), so the
-    # variant grid is empty and Deep Dive runs it on demand for one coin.
-    # When run_backtest=True, we run the full grid here for every coin.
+    # ── Step 12: Optional 24-variant backtest grid (Phase 2) ─────────────────
     _EMPTY_GRID_COLS = [
         "entry_type", "ltf_mode", "tp_R",
         "n_setups", "n_filled", "n_wins",
@@ -288,14 +420,12 @@ def scan_one_symbol_short(
     ]
 
     if run_backtest:
-        # Lazy import — backtest module pulls qf_shared decay-bucket helpers
-        # which we don't need to load on a fast scan
         try:
             from qf_smc_short.backtest import run_variant_grid_short
             variant_grid: pd.DataFrame = run_variant_grid_short(
                 df_htf=df_htf,
                 df_ltf=df_ltf,
-                structure=structure,
+                structure=structure_legacy,
                 fibo_zone=fibo_zone,
                 smart_obs=smart_obs,
                 fvgs=fvgs,
@@ -315,54 +445,58 @@ def scan_one_symbol_short(
         variant_grid = pd.DataFrame(columns=_EMPTY_GRID_COLS)
         best_variant = None
 
-    # ── Step 15: Build result dict (same shape as LONG for UI compat) ───────
+    # ── Step 13: Build result dict ────────────────────────────────────────────
     return {
         # identity
         "symbol":       symbol,
         "mode":         mode,
-        "direction":    "short",       # flag for UI / shared consumers
+        "direction":    "short",
         "htf_tf":       htf_interval,
         "ltf_tf":       ltf_interval,
         "btc_regime":   btc_regime,
         "fights_macro": fights_macro,
 
-        # structure
-        "structure":                  structure,
-        "overall_bearish_verified":   overall_bearish_verified,
-        "wick_adjustments":           wick_adjustments,
+        # NEW (Session 2): hierarchical views
+        "view_used":           view_used,          # "BROAD" | "NARROW" | None
+        "broad_data":          broad_data,          # full dict or None
+        "narrow_data":         narrow_data,         # full dict or None
+        "broad_invalidated":   views.get("broad_invalidated", False),
+        "min_bounce_pct_used": min_bounce_pct,
 
-        # zones
-        "fibo_zone":           fibo_zone,
-        "atr_multiplier_used": atr_multiplier,
+        # structure (legacy — used for wick_adjustments transparency)
+        "structure":                structure_legacy,
+        "overall_bearish_verified": True,   # any valid view implies confirmed downtrend
+        "wick_adjustments":         wick_adjustments,
+
+        # active view's zone data (powers existing render code paths)
+        "fibo_zone":                  active["fibo_zone"],
+        "atr_multiplier_used":        atr_multiplier,
         "zones": {
-            "smart_obs":  smart_obs,
-            "fvgs":       fvgs,
-            "fibo":       fibo_zone,
-            "sr_levels":  sr_levels,
+            "smart_obs": active["smart_obs"],
+            "fvgs":      active["fvgs"],
+            "fibo":      active["fibo_zone"],
+            "sr_levels": active["sr_levels"],
         },
-
-        # price + classification
-        "current_price":               current_price,
-        "current_zone_classification": zone_cls,
-        "primary_zone":                primary_zone,
+        "current_price":               active["current_price"],
+        "current_zone_classification": active["zone_classification"],
+        "primary_zone":                active["primary_zone"],
+        "retracement_status":          active["retracement_status"],
         "ob_tier":                     ob_tier,
         "ema_tier":                    ema_tier,
 
-        # LTF
+        # LTF + trade plan
         "ltf_confirmation": ltf_confirmation,
         "ltf_signal_bar":   ltf_signal_bar,
+        "trade_plan":       trade_plan,
 
         # backtest (Phase 2 — populated when run_backtest=True, else empty)
         "variant_grid":        variant_grid,
         "best_variant":        best_variant,
-        "deep_dive_available": True,    # Phase 2: Deep Dive button enabled
+        "deep_dive_available": True,
 
         # candle cache (for Deep Dive on demand)
         "_df_htf_cache": df_htf,
         "_df_ltf_cache": df_ltf,
-
-        # trade plan
-        "trade_plan": trade_plan,
 
         # metadata
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),

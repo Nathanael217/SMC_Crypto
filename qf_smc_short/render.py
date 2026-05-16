@@ -81,6 +81,70 @@ def _format_variant_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================================
+# HELPER — render one view section (broad or narrow)
+# ============================================================================
+
+def _render_view_block(
+    view_label: str,
+    view_data: Optional[Dict[str, Any]],
+    view_emoji: str,
+    is_priority: bool,
+) -> None:
+    """Render one view section (broad or narrow). Returns None."""
+    if view_data is None:
+        return
+    leg = view_data["leg"]
+    priority_text = " (priority — higher WR)" if is_priority else " (fallback — fast scalp)"
+    st.markdown(f"### {view_emoji} {view_label.upper()} VIEW{priority_text}")
+
+    leg_high = float(leg["leg_start_price"])
+    leg_low  = float(leg["leg_low_price"])
+    leg_pct  = (leg_high - leg_low) / leg_high * 100
+    st.text(f"Leg: ${leg_high:.6f} → ${leg_low:.6f} ({-leg_pct:.2f}%)")
+    st.text(f"Fibo 0.786: ${float(view_data['fib_786']):.6f}")
+    st.text(f"Zone: [${float(view_data['zone_bot']):.6f}, ${float(view_data['zone_top']):.6f}]")
+
+    status = view_data["retracement_status"]
+    status_emoji = {
+        "WAITING":     "⚪",
+        "APPROACHING": "🟡",
+        "ACTIONABLE":  "🟢",
+        "OVERSHOOT":   "🟠",
+        "INVALIDATED": "🔴",
+    }.get(status, "?")
+    st.markdown(f"**Status**: {status_emoji} {status}")
+
+    # OBs in this view's zone
+    smart_obs = view_data.get("smart_obs", [])
+    if smart_obs:
+        ob = smart_obs[0]
+        sweep_icon = " 🌊" if ob.get("tier") == "LIQUIDITY_SWEEP" else ""
+        st.text(
+            f"OB: {ob.get('tier', '?')}{sweep_icon} @ ${float(ob.get('ob_low', 0)):.6f} "
+            f"(vol×{float(ob.get('volume_mult', 0)):.1f})"
+        )
+    else:
+        st.text("OB: none in this view's 0.786 zone")
+
+    # FVGs in this view's zone
+    fvgs = view_data.get("fvgs", [])
+    if fvgs:
+        fvg = fvgs[0]
+        st.text(
+            f"FVG: ${float(fvg.get('bottom', 0)):.6f} – ${float(fvg.get('top', 0)):.6f} "
+            f"({fvg.get('status', '?')})"
+        )
+    else:
+        st.text("FVG: none in this view's 0.786 zone")
+
+    # Resistance S/R in this view's zone
+    srs = view_data.get("sr_levels", [])
+    if srs:
+        sr = srs[0]
+        st.text(f"S/R: ${float(sr.get('price', 0)):.6f} ({sr.get('touches', '?')} touches)")
+
+
+# ============================================================================
 # MAIN SIGNAL CARD RENDERER
 # ============================================================================
 
@@ -109,7 +173,15 @@ def render_signal_card_short(
     ema_tier      = result.get("ema_tier", "")
 
     # ── Build header badges ──────────────────────────────────────────────────
-    badges: List[str] = []
+    view_used = result.get("view_used")
+    if view_used == "BROAD":
+        view_badge = "[🔭 BROAD]"
+    elif view_used == "NARROW":
+        view_badge = "[🔍 NARROW]"
+    else:
+        view_badge = "[⏳ WAITING — no view actionable yet]"
+
+    badges: List[str] = [view_badge]
     if ob_tier:
         badges.append(f"[OB: {ob_tier}]")
     if ema_tier:
@@ -119,7 +191,7 @@ def render_signal_card_short(
     badge_str = "  " + "  ".join(badges) if badges else ""
 
     with st.expander(
-        f"🔻 **{symbol}** @ ${current_price:.6f}{badge_str}",
+        f"🔻 **{symbol}** @ ${current_price:.6f}  {badge_str}",
         expanded=False,
     ):
         # ── Row 1: Structure / Fibo + Zones ──────────────────────────────────
@@ -204,6 +276,20 @@ def render_signal_card_short(
             else:
                 st.text("No resistance levels in zone")
 
+        # ── Dual-View: BROAD + NARROW ─────────────────────────────────────────
+        broad_data  = result.get("broad_data")
+        narrow_data = result.get("narrow_data")
+
+        if broad_data or narrow_data:
+            st.markdown("---")
+            if broad_data:
+                _render_view_block("Broad", broad_data, "🔭", is_priority=True)
+            if broad_data and narrow_data:
+                st.markdown("---")
+            if narrow_data:
+                _render_view_block("Narrow", narrow_data, "🔍", is_priority=False)
+            st.markdown("---")
+
         # ── Wick Adjustments Detail ──────────────────────────────────────────
         wick_adj = result.get("wick_adjustments", [])
         if wick_adj:
@@ -275,20 +361,25 @@ def render_signal_card_short(
                 f"n={best_variant.get('n_setups', 0)}"
             )
 
-        # ── Trade Plan (from scanner — always present) ───────────────────────
-        tp = result.get("trade_plan", {})
-        if tp:
-            st.markdown("**📋 Trade Plan (SHORT)**")
-            plan_cols = st.columns(2)
-            with plan_cols[0]:
-                st.text(f"Entry zone: {tp.get('entry_zone_type', '?')}")
-                st.text(f"Entry:      ${float(tp.get('entry_price', 0)):.6f}")
-                st.text(f"SL (above): ${float(tp.get('sl', 0)):.6f}")
-            with plan_cols[1]:
-                st.text(f"TP1 (2R):   ${float(tp.get('tp1_price', 0)):.6f}")
-                st.text(f"TP2 (2.5R): ${float(tp.get('tp2_price', 0)):.6f}")
-                st.text(f"TP3 (3R):   ${float(tp.get('tp3_price', 0)):.6f}")
-                st.text(f"R:R to TP2: {float(tp.get('rr_to_tp2', 0)):.2f}")
+        # ── Trade Plan (from scanner — uses active view) ─────────────────────
+        if view_used is None:
+            st.info(
+                "⏳ Waiting for retracement to 0.786 zone before entry plan is computed."
+            )
+        else:
+            tp = result.get("trade_plan", {})
+            if tp:
+                st.markdown("**📋 Trade Plan (SHORT)**")
+                plan_cols = st.columns(2)
+                with plan_cols[0]:
+                    st.text(f"Entry zone: {tp.get('entry_zone_type', '?')}")
+                    st.text(f"Entry:      ${float(tp.get('entry_price', 0)):.6f}")
+                    st.text(f"SL (above): ${float(tp.get('sl', 0)):.6f}")
+                with plan_cols[1]:
+                    st.text(f"TP1 (2R):   ${float(tp.get('tp1_price', 0)):.6f}")
+                    st.text(f"TP2 (2.5R): ${float(tp.get('tp2_price', 0)):.6f}")
+                    st.text(f"TP3 (3R):   ${float(tp.get('tp3_price', 0)):.6f}")
+                    st.text(f"R:R to TP2: {float(tp.get('rr_to_tp2', 0)):.2f}")
 
         # ── Tier Tooltips ────────────────────────────────────────────────────
         if ob_tier or ema_tier:

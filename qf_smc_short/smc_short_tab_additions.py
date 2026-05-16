@@ -269,6 +269,22 @@ def render_smc_short_mode_scan_subtab():
         )
         st.session_state["smc_short_atr_multiplier"] = atr_multiplier
 
+        # NEW: min bounce filter
+        min_bounce_choice = st.radio(
+            "Minimum bounce filter (for LH validity)",
+            options=["0.236 (looser, more setups)", "0.382 (stricter, cleaner setups)"],
+            index=0,
+            key="smc_short_min_bounce",
+            help=(
+                "For an LH to count as valid structural high, the bounce from "
+                "prior LL must retrace at least this fraction of the prior "
+                "down-leg. 0.236 captures more setups but includes some noise. "
+                "0.382 filters to higher-quality structural pivots."
+            ),
+        )
+        min_bounce_pct = 0.236 if min_bounce_choice.startswith("0.236") else 0.382
+        st.session_state["smc_short_min_bounce_pct"] = min_bounce_pct
+
         # Phase 2: opt-in eager backtest
         run_bt_eager = st.checkbox(
             "Run 24-variant backtest during scan (slower)",
@@ -304,6 +320,7 @@ def render_smc_short_mode_scan_subtab():
                 symbols=candidates,
                 btc_regime=btc_regime,
                 atr_multiplier=st.session_state.get("smc_short_atr_multiplier", 0.5),
+                min_bounce_pct=st.session_state.get("smc_short_min_bounce_pct", 0.236),  # NEW
                 run_backtest=run_bt,
                 progress_callback=progress_callback,
             )
