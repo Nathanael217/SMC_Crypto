@@ -597,3 +597,370 @@ def is_uptrend_confirmed(state: dict) -> bool:
         True if state["state"] in {"BOS", "UPTREND"}, False otherwise.
     """
     return state.get("state") in {_STATE_BOS, _STATE_UPTREND}
+
+
+# ============================================================================
+# Hierarchical View Detection — LONG (UPTREND)
+# ============================================================================
+
+def find_hierarchical_views_long(
+    swings: dict,
+    df: pd.DataFrame,
+    min_bounce_pct: float = 0.236,
+) -> Dict[str, Any]:
+    """
+    Detect two nested HL→HH legs (BROAD and NARROW) inside a confirmed uptrend.
+
+    Hierarchy concept
+    -----------------
+    In an uptrend, price makes Higher Lows (HL) and Higher Highs (HH).  Each
+    pullback from a HH creates a new HL.  Two distinct views exist simultaneously:
+
+      BROAD VIEW  — the larger, more significant HL→HH pair.  This is the
+                    *most-recent still-valid* HL that has NOT been broken
+                    downward.  It represents the dominant up-leg that traders
+                    use for Fibonacci zone placement.
+
+      NARROW VIEW — a *later* (more recent) HL→HH pair that sits *inside* the
+                    broad leg: the narrow HL is above the broad HL, and the
+                    narrow HL-HH pair formed AFTER the broad HH.  It is the
+                    smaller pullback setup used as a fallback entry.
+
+    Example (BTCUSDT 4h in uptrend):
+      Broad:  HL @ $94,000 → HH @ $99,000   (main up-leg)
+      Narrow: HL @ $96,000 → HH @ $98,000   (smaller pullback inside the broad leg)
+
+    min_bounce_pct (default 0.236 = 23.6% Fibonacci)
+    --------------------------------------------------
+    A HL is only considered structurally meaningful if the *pullback that
+    created it* retraced at least ``min_bounce_pct`` of the prior up-leg.
+    Tiny noise-pullbacks are excluded.
+
+      prior_up_leg_range = prior_HH_price - prior_HL_price
+      pullback_pct       = (prior_HH_price - HL_price) / prior_up_leg_range
+      Reject if pullback_pct < min_bounce_pct
+
+    Wick rule (liquidity sweep filter)
+    -----------------------------------
+    When checking whether a HL has been "broken" by a later bar, a candle
+    whose wick pierced the HL but whose body stayed above it may be a
+    liquidity sweep rather than a genuine break.  The rule:
+
+      wick_below_HL  = min(open, close, HL_price) − candle_low
+      candle_range   = candle_high − candle_low
+      wick_ratio     = wick_below_HL / candle_range
+
+      If wick_ratio > 0.5 AND a next candle exists:
+          if next_candle.close > HL_price → sweep, HL still valid
+          else                            → truly broken
+      Else (wick_ratio ≤ 0.5 OR last bar) → HL is broken (strict)
+
+    Parameters
+    ----------
+    swings : dict returned by detect_swings()
+        Must contain keys ``swing_highs`` and ``swing_lows``, each a list
+        of (bar_idx, price) tuples.  The existing classify_structure()
+        in the same file uses the same format.
+    df : pd.DataFrame
+        Raw OHLCV data (columns: open, high, low, close, volume).
+        Index must be integer-positional (0-based).
+    min_bounce_pct : float, optional
+        Minimum retrace fraction of the prior up-leg for a pullback to qualify
+        as a meaningful HL.  Default 0.236 (23.6%).
+
+    Returns
+    -------
+    dict with keys:
+      ``broad``               — leg dict or None
+      ``narrow``              — leg dict or None
+      ``broad_invalidated``   — True if the broad HL was broken downward
+      ``narrow_invalidated``  — True if the narrow HL was broken downward
+      ``reason``              — human-readable explanation string
+
+    Each leg dict matches the ``current_leg`` shape consumed by zones.py:
+      {
+        "leg_start_bar":   int,    # bar index of HL (the low anchor)
+        "leg_start_price": float,  # HL price
+        "leg_high_bar":    int,    # bar index of HH
+        "leg_high_price":  float,  # HH price
+      }
+
+    This naming is identical to classify_structure()'s current_leg keys for
+    UPTREND/BOS states (leg_start_price = HL, leg_high_price = HH).
+
+    Edge cases
+    ----------
+    * swings empty OR df has fewer than 20 bars → all None, reason="Insufficient data"
+    * Only 1 valid pair  → broad = that pair, narrow = None
+    * Broad == Narrow    → broad = pair, narrow = None (no duplicates)
+
+    # -----------------------------------------------------------------------
+    # UNIT-TEST ASSERTIONS (commented out — reference only)
+    # -----------------------------------------------------------------------
+    # Given synthetic swings: SL@9.50, SH@10.50, SL@10.10 (HL), SH@10.70 (HH),
+    #                          SL@10.40 (HL2), SH@11.00 (HH2)
+    #
+    # HL candidates:
+    #   HL-A: 10.10 > 9.50 → prior_up = 10.50-9.50=1.00, pullback=(10.50-10.10)/1.00=40% ✓
+    #   HL-B: 10.40 > 10.10 → prior_up = 10.70-10.10=0.60, pullback=(10.70-10.40)/0.60=50% ✓
+    #
+    # Most-recent still-valid with HH after it:
+    #   HL-B (10.40) → HH @ 11.00 = might be BROAD (most recent)
+    #   HL-A (10.10) → HH @ 10.70 = BROAD if HL-B came after HH of HL-A
+    #
+    # assert result["broad"]["leg_start_price"] >= result["broad"]["leg_high_price"] is False
+    # assert result["broad"]["leg_high_price"] > result["broad"]["leg_start_price"]
+    # assert result["broad_invalidated"] is False
+    """
+
+    # ------------------------------------------------------------------
+    # Guard: insufficient data
+    # ------------------------------------------------------------------
+    _EMPTY: Dict[str, Any] = {
+        "broad": None,
+        "narrow": None,
+        "broad_invalidated": False,
+        "narrow_invalidated": False,
+        "reason": "Insufficient data",
+    }
+
+    if not isinstance(swings, dict) or not swings.get("swing_lows") or len(df) < 20:
+        return _EMPTY
+
+    # ------------------------------------------------------------------
+    # Step 1: separate swing highs and lows in bar order
+    # ------------------------------------------------------------------
+    all_highs: List[Tuple[int, float]] = sorted(
+        swings.get("swing_highs", []),
+        key=lambda x: x[0],
+    )
+    all_lows: List[Tuple[int, float]] = sorted(
+        swings.get("swing_lows", []),
+        key=lambda x: x[0],
+    )
+
+    if len(all_lows) < 2 or len(all_highs) < 1:
+        return _EMPTY
+
+    # ------------------------------------------------------------------
+    # Step 2: merge all swings into one chronological sequence
+    # ------------------------------------------------------------------
+    all_swings_sorted: List[Tuple[int, float, str]] = sorted(
+        [(b, p, "high") for b, p in all_highs]
+        + [(b, p, "low")  for b, p in all_lows],
+        key=lambda x: x[0],
+    )
+
+    # ------------------------------------------------------------------
+    # Step 3: build HL candidates with pullback metrics
+    # ------------------------------------------------------------------
+    # Walk the merged swing list.  When we encounter a swing low that is
+    # HIGHER than the previous swing low, it is a Higher Low (HL) candidate.
+    # We also track the last swing high seen before the HL so we can compute
+    # the prior up-leg range for the pullback-percentage filter.
+
+    last_sh_bar:   Optional[int]   = None
+    last_sh_price: Optional[float] = None
+    last_sl_bar:   Optional[int]   = None
+    last_sl_price: Optional[float] = None
+
+    hl_candidates: List[Dict[str, Any]] = []
+
+    for bar, price, stype in all_swings_sorted:
+        if stype == "low":
+            if last_sl_price is not None and price > last_sl_price:
+                # This swing low is higher than the previous → HL candidate
+                if last_sh_price is not None and last_sh_bar is not None:
+                    # prior up-leg: from last_sl_price up to last_sh_price
+                    prior_up_range = last_sh_price - last_sl_price
+                    if prior_up_range > 0:
+                        pullback_pct = (last_sh_price - price) / prior_up_range
+                        hl_candidates.append({
+                            "hl_bar":         bar,
+                            "hl_price":       price,
+                            "prior_sl_price": last_sl_price,
+                            "prior_sh_bar":   last_sh_bar,
+                            "prior_sh_price": last_sh_price,
+                            "pullback_pct":   pullback_pct,
+                        })
+            # Update last-seen swing low regardless
+            last_sl_bar   = bar
+            last_sl_price = price
+        else:  # high
+            last_sh_bar   = bar
+            last_sh_price = price
+
+    if not hl_candidates:
+        return {**_EMPTY, "reason": "No HL candidates found"}
+
+    # ------------------------------------------------------------------
+    # Step 4: pair each HL with its subsequent HH, apply pullback filter
+    # ------------------------------------------------------------------
+    valid_pairs: List[Dict[str, Any]] = []
+
+    for cand in hl_candidates:
+        hl_bar   = cand["hl_bar"]
+        hl_price = cand["hl_price"]
+
+        # Skip if pullback too small (noise)
+        if cand["pullback_pct"] < min_bounce_pct:
+            continue
+
+        # Find the most recent swing high AFTER this HL
+        paired_hh: Optional[Tuple[int, float]] = None
+        for sh_bar, sh_price in all_highs:
+            if sh_bar > hl_bar:
+                if paired_hh is None or sh_bar > paired_hh[0]:
+                    paired_hh = (sh_bar, sh_price)
+
+        if paired_hh is None:
+            continue  # no HH after this HL yet
+
+        hh_bar, hh_price = paired_hh
+
+        if hh_price <= hl_price:
+            continue  # degenerate: HH must be strictly above HL
+
+        valid_pairs.append({
+            "hl_bar":       hl_bar,
+            "hl_price":     hl_price,
+            "hh_bar":       hh_bar,
+            "hh_price":     hh_price,
+            "pullback_pct": cand["pullback_pct"],
+        })
+
+    if not valid_pairs:
+        return {**_EMPTY, "reason": "No HL-HH pairs passed pullback filter"}
+
+    # Sort chronologically by HL bar
+    valid_pairs.sort(key=lambda x: x["hl_bar"])
+
+    # ------------------------------------------------------------------
+    # Helper: is_hl_broken(hl_price, after_bar)
+    # ------------------------------------------------------------------
+    def is_hl_broken(hl_price: float, after_bar: int) -> bool:
+        """
+        Return True if any bar AFTER ``after_bar`` genuinely breaks BELOW
+        ``hl_price`` (i.e. the HL support has failed).
+
+        Applies the wick rule: a candle whose low dips below HL but whose
+        body remains above it is treated as a liquidity sweep if the next
+        candle closes back above HL.
+        """
+        max_bar = len(df) - 1
+        for idx in range(after_bar + 1, max_bar + 1):
+            if df["low"].iloc[idx] < hl_price:
+                c_high  = df["high"].iloc[idx]
+                c_low   = df["low"].iloc[idx]
+                c_open  = df["open"].iloc[idx]
+                c_close = df["close"].iloc[idx]
+                c_range = c_high - c_low
+
+                if c_range == 0:
+                    return True  # doji at/below HL → broken
+
+                # wick_below_HL: portion of the candle range that is a wick
+                # below the lower of (open, close, HL_price)
+                wick_below = min(c_open, c_close, hl_price) - c_low
+                wick_ratio = wick_below / c_range
+
+                if wick_ratio > 0.5 and idx < max_bar:
+                    # Long lower wick — potential sweep; check next candle
+                    next_close = df["close"].iloc[idx + 1]
+                    if next_close > hl_price:
+                        continue  # confirmed sweep: HL still valid
+                    else:
+                        return True  # price continued lower → broken
+                else:
+                    # Body break, or wick ≤ 50%, or last bar → strict break
+                    return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Step 5: find BROAD VIEW = most-recent still-valid HL-HH pair
+    # ------------------------------------------------------------------
+    broad_pair: Optional[Dict[str, Any]] = None
+    broad_invalidated = False
+
+    for pair in reversed(valid_pairs):
+        if not is_hl_broken(pair["hl_price"], pair["hh_bar"]):
+            broad_pair = pair
+            break
+
+    # If no valid pair found, the most-recent pair is considered invalidated
+    if broad_pair is None and valid_pairs:
+        broad_invalidated = True
+
+    # ------------------------------------------------------------------
+    # Step 6: find NARROW VIEW
+    # ------------------------------------------------------------------
+    narrow_pair: Optional[Dict[str, Any]] = None
+    narrow_invalidated = False
+
+    if broad_pair is not None:
+        # Narrow must:
+        #   - have HL bar AFTER broad_pair["hh_bar"]  (formed after broad HH)
+        #   - have HL price ABOVE broad_pair["hl_price"]  (nested inside broad)
+        #   - not be the same object as broad_pair
+        #   - not be broken downward
+        narrow_candidates = [
+            p for p in valid_pairs
+            if p["hl_bar"] > broad_pair["hh_bar"]
+            and p["hl_price"] > broad_pair["hl_price"]
+            and p is not broad_pair
+        ]
+
+        for pair in reversed(narrow_candidates):
+            if not is_hl_broken(pair["hl_price"], pair["hh_bar"]):
+                narrow_pair = pair
+                break
+            else:
+                narrow_invalidated = True
+
+    # ------------------------------------------------------------------
+    # Step 7: build output leg dicts (key names match classify_structure)
+    # ------------------------------------------------------------------
+    def _to_leg(p: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "leg_start_bar":   int(p["hl_bar"]),
+            "leg_start_price": float(p["hl_price"]),
+            "leg_high_bar":    int(p["hh_bar"]),
+            "leg_high_price":  float(p["hh_price"]),
+        }
+
+    broad_leg  = _to_leg(broad_pair)  if broad_pair  is not None else None
+    narrow_leg = _to_leg(narrow_pair) if narrow_pair is not None else None
+
+    # ------------------------------------------------------------------
+    # Step 8: compose reason string
+    # ------------------------------------------------------------------
+    parts: List[str] = []
+    if broad_invalidated:
+        parts.append("broad HL broken (trend reversed or insufficient valid pairs)")
+    elif broad_leg:
+        parts.append(
+            f"broad: HL@{broad_leg['leg_start_price']:.4f} bar={broad_leg['leg_start_bar']}"
+            f" → HH@{broad_leg['leg_high_price']:.4f} bar={broad_leg['leg_high_bar']}"
+        )
+    else:
+        parts.append("no broad HL-HH pair found")
+
+    if narrow_invalidated and narrow_leg is None:
+        parts.append("narrow: all candidates broken")
+    elif narrow_leg:
+        parts.append(
+            f"narrow: HL@{narrow_leg['leg_start_price']:.4f} bar={narrow_leg['leg_start_bar']}"
+            f" → HH@{narrow_leg['leg_high_price']:.4f} bar={narrow_leg['leg_high_bar']}"
+        )
+    else:
+        parts.append("narrow: none (no qualifying sub-leg after broad HH)")
+
+    reason = "; ".join(parts)
+
+    return {
+        "broad":              broad_leg,
+        "narrow":             narrow_leg,
+        "broad_invalidated":  broad_invalidated,
+        "narrow_invalidated": narrow_invalidated,
+        "reason":             reason,
+    }

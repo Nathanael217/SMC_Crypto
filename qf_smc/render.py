@@ -89,6 +89,76 @@ def _format_variant_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================================
+# HELPER — render one hierarchical view block (LONG)
+# ============================================================================
+
+_STATUS_EMOJI_LONG = {
+    "WAITING":     "⏳",
+    "APPROACHING": "🔜",
+    "ACTIONABLE":  "✅",
+    "OVERSHOOT":   "⚠️",
+    "INVALIDATED": "❌",
+}
+
+
+def _render_view_block_long(
+    label: str,
+    view_data: Dict[str, Any],
+    is_active: bool,
+) -> None:
+    """
+    Render one hierarchical leg (BROAD or NARROW) for the LONG scanner.
+
+    Uses LONG terminology:
+        HL  — higher low (leg start, structural anchor)
+        HH  — higher high (leg end, impulse top)
+        Leg: $HL → $HH (+X%)
+    """
+    fibo_z     = view_data.get("fibo_zone") or {}
+    smart_obs  = view_data.get("smart_obs",  [])
+    fvgs_list  = view_data.get("fvgs",       [])
+    srs        = view_data.get("sr_levels",  [])
+    ret_status = view_data.get("retracement_status", "WAITING")
+    emoji      = _STATUS_EMOJI_LONG.get(ret_status, "❓")
+    active_tag = " 🔵 **ACTIVE**" if is_active else ""
+
+    st.markdown(f"**{label} VIEW**{active_tag}  {emoji} `{ret_status}`")
+
+    # Fibo zone info
+    if fibo_z:
+        hl_price = float(fibo_z.get("leg_start_price", fibo_z.get("swing_low", 0)))
+        hh_price = float(fibo_z.get("leg_high_price",  fibo_z.get("swing_high", 0)))
+        if hh_price > 0 and hl_price > 0:
+            leg_pct = ((hh_price - hl_price) / hl_price) * 100
+            st.text(f"  Leg:        ${hl_price:.6f} HL → ${hh_price:.6f} HH (+{leg_pct:.2f}%)")
+        fib_786  = float(fibo_z.get("fib_786", 0))
+        zone_top = float(fibo_z.get("fib_786_zone_top", 0))
+        zone_bot = float(fibo_z.get("fib_786_zone_bottom", 0))
+        if fib_786:
+            st.text(f"  Fibo 0.786: ${fib_786:.6f}")
+            st.text(f"  Zone:       [${zone_bot:.6f}, ${zone_top:.6f}]")
+
+    # OBs
+    if smart_obs:
+        st.text(f"  OBs ({len(smart_obs)}): " + ", ".join(
+            f"{ob.get('tier','?')}@${float(ob.get('ob_high',0)):.6f}"
+            for ob in smart_obs[:3]
+        ))
+    # FVGs
+    if fvgs_list:
+        st.text(f"  FVGs ({len(fvgs_list)}): " + ", ".join(
+            f"{f.get('status','?')}[${float(f.get('bottom',0)):.6f}-${float(f.get('top',0)):.6f}]"
+            for f in fvgs_list[:3]
+        ))
+    # S/R
+    if srs:
+        st.text(f"  S/R ({len(srs)}): " + ", ".join(
+            f"${float(sr.get('price',0)):.6f}"
+            for sr in srs[:3]
+        ))
+
+
+# ============================================================================
 # MAIN DETAILED CARD RENDERER
 # ============================================================================
 
@@ -114,9 +184,13 @@ def render_signal_card_detail_v2(
     fights_macro  = result.get("fights_macro", False)
     ob_tier       = result.get("ob_tier", "")
     ema_tier      = result.get("ema_tier", "")
+    view_used     = result.get("view_used", "")
 
     # ── Build header badge string ─────────────────────────────────────────────
     badges: List[str] = []
+    if view_used:
+        view_icon = "🔭" if view_used == "BROAD" else "🔍"
+        badges.append(f"[{view_icon} {view_used}]")
     if ob_tier:
         badges.append(f"[OB: {ob_tier}]")
     if ema_tier:
@@ -171,6 +245,22 @@ def render_signal_card_detail_v2(
             wick_adj = result.get("wick_adjustments", [])
             if wick_adj:
                 st.text(f"Wick adj:    {len(wick_adj)} made")
+
+            # ── Dual-view blocks (Session 5 — LONG hierarchical views) ───────
+            broad_data  = result.get("broad_data")
+            narrow_data = result.get("narrow_data")
+            if broad_data is not None or narrow_data is not None:
+                st.markdown("---")
+                if broad_data is not None:
+                    _render_view_block_long(
+                        "🔭 BROAD", broad_data,
+                        is_active=(view_used == "BROAD"),
+                    )
+                if narrow_data is not None:
+                    _render_view_block_long(
+                        "🔍 NARROW", narrow_data,
+                        is_active=(view_used == "NARROW"),
+                    )
 
         with col2:
             st.markdown("**\U0001f3af Zones in Fibo 0.786 Area**")

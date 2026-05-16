@@ -34,7 +34,7 @@ from qf_shared import (
     calculate_ema,
     _clean_df,
 )
-from qf_smc.structure import detect_swings, classify_structure, is_uptrend_confirmed
+from qf_smc.structure import detect_swings, classify_structure, is_uptrend_confirmed, find_hierarchical_views_long
 from qf_smc.zones import (
     detect_smart_obs, detect_fvgs, detect_fibo_levels, detect_sr_levels,
     classify_current_price_in_zones,
@@ -51,9 +51,9 @@ from qf_smc.backtest import (
 # ============================================================================
 
 MODE_CONFIG: Dict[str, Dict[str, Any]] = {
-    "SWING": {"htf": "1d",  "ltf": "4h",  "lookback": 50, "htf_label": "1D", "ltf_label": "4H"},
-    "DAY":   {"htf": "4h",  "ltf": "15m", "lookback": 50, "htf_label": "4H", "ltf_label": "15m"},
-    "SCALP": {"htf": "1h",  "ltf": "5m",  "lookback": 50, "htf_label": "1H", "ltf_label": "5m"},
+    "SWING": {"htf": "1d",  "ltf": "4h",  "lookback": 100, "htf_label": "1D", "ltf_label": "4H"},
+    "DAY":   {"htf": "4h",  "ltf": "15m", "lookback": 100, "htf_label": "4H", "ltf_label": "15m"},
+    "SCALP": {"htf": "1h",  "ltf": "5m",  "lookback": 100, "htf_label": "1H", "ltf_label": "5m"},
 }
 
 # Default TP R-multiple for legacy backtest_per_coin calls (still available)
@@ -70,6 +70,7 @@ def run_scan(
     btc_regime: str,
     atr_multiplier: float = 0.5,                              # NEW v1.2
     run_backtest: bool = False,                               # NEW v1.2b — scan is fast by default
+    min_bounce_pct: float = 0.236,                            # NEW Session 5
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -132,6 +133,7 @@ def run_scan(
             sym, mode, btc_regime,
             atr_multiplier=atr_multiplier,
             run_backtest=run_backtest,
+            min_bounce_pct=min_bounce_pct,
         )
 
     completed = 0
@@ -213,6 +215,7 @@ def scan_one_symbol(
     btc_regime: str,
     atr_multiplier: float = 0.5,    # NEW v1.2
     run_backtest: bool = False,     # NEW v1.2b — False = fast scan, skip 24-variant grid
+    min_bounce_pct: float = 0.236,  # NEW Session 5
 ) -> Optional[Dict[str, Any]]:
     """
     Full pipeline for ONE symbol.
@@ -277,16 +280,107 @@ def scan_one_symbol(
     if not is_uptrend_confirmed(structure):
         return None  # state is UNDEFINED, DOWNTREND, or CHOCH
 
-    # ── Step 6: Fibo zone FIRST (v1.2) ───────────────────────────────────────
-    # detect_fibo_levels returns {} when current_leg is absent
-    fibo_zone = detect_fibo_levels(df_htf, structure, atr_multiplier=atr_multiplier)
+    # ── Step 5b: Hierarchical views (Session 5) ───────────────────────────────
+    views = find_hierarchical_views_long(swings, df_htf, min_bounce_pct=min_bounce_pct)
+
+    # Hard stop: broad view structure has been invalidated
+    if views.get("broad_invalidated"):
+        return None
+
+    broad_leg  = views.get("broad")
+    narrow_leg = views.get("narrow")
+
+    # Must have at least one valid leg
+    if broad_leg is None and narrow_leg is None:
+        return None
+
+    def _compute_view_zone_data(leg: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Given one hierarchical leg dict (broad or narrow), compute fibo zone,
+        smart OBs, FVGs, SR levels, and retracement_status for that view.
+        The leg dict from find_hierarchical_views_long uses:
+            leg_start_price  — HL low
+            leg_high_price   — HH high
+        which matches what classify_structure()/zones.py expect as current_leg.
+        """
+        # Build a minimal structure-like dict for the zone detectors
+        structure_for_view = dict(structure)
+        structure_for_view["current_leg"] = {
+            "leg_start_bar":   leg.get("leg_start_bar"),
+            "leg_start_price": leg.get("leg_start_price"),   # HL
+            "leg_high_bar":    leg.get("leg_high_bar"),
+            "leg_high_price":  leg.get("leg_high_price"),    # HH
+        }
+
+        fibo_z   = detect_fibo_levels(df_htf, structure_for_view, atr_multiplier=atr_multiplier)
+        s_obs    = detect_smart_obs(df_htf, structure_for_view, fibo_786_zone=fibo_z, require_in_zone=True)
+        _fvgs    = detect_fvgs(df_htf, structure_for_view, fibo_786_zone=fibo_z, require_in_zone=True)
+        sr_lvls  = detect_sr_levels(df_htf, lookback=lookback, fibo_786_zone=fibo_z, require_in_zone=True)
+
+        # Retracement status — LONG: price pulled back DOWN from HH
+        ret_status = "WAITING"
+        if fibo_z:
+            cp            = float(df_htf["close"].iloc[-1])
+            fib_618       = float(fibo_z.get("fib_618", 0))
+            zone_top      = float(fibo_z.get("fib_786_zone_top", 0))
+            zone_bot      = float(fibo_z.get("fib_786_zone_bottom", 0))
+            fib_886       = float(fibo_z.get("fib_886", zone_bot * 0.99))
+
+            if cp > fib_618:
+                ret_status = "WAITING"
+            elif cp > zone_top:
+                ret_status = "APPROACHING"
+            elif cp >= zone_bot:
+                ret_status = "ACTIONABLE"
+            elif cp >= fib_886:
+                ret_status = "OVERSHOOT"
+            else:
+                ret_status = "INVALIDATED"
+
+        return {
+            "fibo_zone":          fibo_z,
+            "smart_obs":          s_obs,
+            "fvgs":               _fvgs,
+            "sr_levels":          sr_lvls,
+            "retracement_status": ret_status,
+        }
+
+    # Compute zone data for each available view
+    broad_data  = _compute_view_zone_data(broad_leg)  if broad_leg  is not None else None
+    narrow_data = _compute_view_zone_data(narrow_leg) if narrow_leg is not None else None
+
+    # Determine active view (BROAD preferred, NARROW fallback)
+    if broad_data is not None and broad_data["retracement_status"] not in ("INVALIDATED",):
+        active_view      = "BROAD"
+        active_view_data = broad_data
+    elif narrow_data is not None and narrow_data["retracement_status"] not in ("INVALIDATED",):
+        active_view      = "NARROW"
+        active_view_data = narrow_data
+    else:
+        # Neither view is tradeable — skip unless one is APPROACHING
+        broad_approaching  = broad_data  is not None and broad_data["retracement_status"]  == "APPROACHING"
+        narrow_approaching = narrow_data is not None and narrow_data["retracement_status"] == "APPROACHING"
+        if not broad_approaching and not narrow_approaching:
+            return None
+        # One is APPROACHING — keep the one that is
+        if broad_approaching:
+            active_view      = "BROAD"
+            active_view_data = broad_data
+        else:
+            active_view      = "NARROW"
+            active_view_data = narrow_data
+
+    retracement_status = active_view_data["retracement_status"]
+
+    # ── Step 6: Fibo zone from active hierarchical view (Session 5) ──────────
+    fibo_zone = active_view_data["fibo_zone"]
     if not fibo_zone:
         return None  # no current leg → can't define zone
 
-    # ── Step 7: Zone detectors WITH Fibo 0.786 filter ────────────────────────
-    smart_obs = detect_smart_obs(df_htf, structure, fibo_786_zone=fibo_zone, require_in_zone=True)
-    fvgs      = detect_fvgs(df_htf, structure, fibo_786_zone=fibo_zone, require_in_zone=True)
-    sr_levels = detect_sr_levels(df_htf, lookback=lookback, fibo_786_zone=fibo_zone, require_in_zone=True)
+    # ── Step 7: Zone detectors (already computed per-view above) ─────────────
+    smart_obs = active_view_data["smart_obs"]
+    fvgs      = active_view_data["fvgs"]
+    sr_levels = active_view_data["sr_levels"]
 
     # ── Step 8: Require at least one zone inside Fibo 0.786 area ─────────────
     if not smart_obs and not fvgs and not sr_levels:
@@ -387,6 +481,14 @@ def scan_one_symbol(
         "structure":                 structure,
         "overall_bullish_verified":  overall_bullish_verified,   # NEW v1.2
         "wick_adjustments":          wick_adjustments,           # NEW v1.2
+
+        # ── hierarchical views (Session 5) ────────────────────────────────────
+        "view_used":           active_view,                      # "BROAD" | "NARROW"
+        "broad_data":          broad_data,
+        "narrow_data":         narrow_data,
+        "broad_invalidated":   views.get("broad_invalidated", False),
+        "min_bounce_pct_used": min_bounce_pct,
+        "retracement_status":  retracement_status,
 
         # ── fibo zone (NEW v1.2) ───────────────────────────────────────────────
         "fibo_zone":           fibo_zone,
